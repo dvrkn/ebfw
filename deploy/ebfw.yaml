@@ -1,0 +1,66 @@
+# ebfw Stage-0 PoC — node egress monitor.
+#
+# A DaemonSet runs one agent pod per node. Each agent attaches a
+# cgroup_skb/egress eBPF program at the node's root cgroup v2, so it observes
+# every pod's egress traffic on that node and prints domains / paths / dst IPs.
+#
+# Privileged + hostNetwork + host cgroup mount are required to load eBPF and
+# attach at the host cgroup. See README for the fine-grained-capabilities
+# alternative and for pinning this to a single node (literal "pod on one node").
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ebfw
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebfw
+  namespace: ebfw
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebfw
+  namespace: ebfw
+  labels:
+    app: ebfw
+spec:
+  selector:
+    matchLabels:
+      app: ebfw
+  template:
+    metadata:
+      labels:
+        app: ebfw
+    spec:
+      serviceAccountName: ebfw
+      hostNetwork: true
+      hostPID: true
+      # Run on every node, including control-plane nodes.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ebfw
+          image: ebfw:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--cgroup=/sys/fs/cgroup"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+              mountPropagation: HostToContainer
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
