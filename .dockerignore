@@ -1,0 +1,6 @@
+.git
+bin/
+ebpf-skill/
+*.o
+bpf_bpfel.go
+bpf_bpfeb.go
