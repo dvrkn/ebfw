@@ -1,12 +1,13 @@
-# ebfw Stage-0 PoC — node egress monitor.
+# ebfw — node egress visibility agent (single DaemonSet, single binary).
 #
-# A DaemonSet runs one agent pod per node. Each agent attaches a
-# cgroup_skb/egress eBPF program at the node's root cgroup v2, so it observes
-# every pod's egress traffic on that node and prints domains / paths / dst IPs.
+# Each agent attaches a cgroup_skb/egress eBPF program at the node's root cgroup
+# v2 (sees every pod's egress) and, when path inspection is enabled, an
+# SSL_write uprobe per container libssl (HTTPS request paths). Internal
+# domains/IPs are filtered per the ConfigMap.
 #
-# Privileged + hostNetwork + host cgroup mount are required to load eBPF and
-# attach at the host cgroup. See README for the fine-grained-capabilities
-# alternative and for pinning this to a single node (literal "pod on one node").
+# Config split:
+#   - filtering (cgroup + exclude lists) -> config.yaml, mounted at /etc/ebfw
+#   - inspection depth -> environment variables sourced from this ConfigMap
 ---
 apiVersion: v1
 kind: Namespace
@@ -18,6 +19,37 @@ kind: ServiceAccount
 metadata:
   name: ebfw
   namespace: ebfw
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ebfw-config
+  namespace: ebfw
+data:
+  # Inspection toggles (read as env vars by the agent).
+  inspect-paths: "true"     # capture HTTPS paths via SSL_write uprobe (essential)
+  inspect-headers: "true"   # also print HTTP/HTTPS request headers
+  inspect-body: "false"     # STUB: request-body capture (not implemented)
+  config.yaml: |
+    cgroup: /sys/fs/cgroup
+    exclude:
+      # Suppress traffic to these destination CIDRs (cluster/private/loopback).
+      cidrs:
+        - 127.0.0.0/8
+        - ::1/128
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - fe80::/10
+        - fc00::/7
+      # Suppress DNS/SNI/HTTP for these domain suffixes.
+      domainSuffixes:
+        - cluster.local
+        - svc
+        - local
+        - in-addr.arpa
+        - ip6.arpa
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -37,18 +69,31 @@ spec:
     spec:
       serviceAccountName: ebfw
       hostNetwork: true
-      hostPID: true
-      # Run on every node, including control-plane nodes.
+      hostPID: true   # needed to find each container's libssl via /proc
       tolerations:
         - operator: Exists
       containers:
         - name: ebfw
           image: ebfw:dev
           imagePullPolicy: IfNotPresent
-          args: ["--cgroup=/sys/fs/cgroup"]
           securityContext:
             privileged: true
+          env:
+            - name: EBFW_CONFIG
+              value: /etc/ebfw/config.yaml
+            - name: EBFW_INSPECT_PATHS
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: inspect-paths }
+            - name: EBFW_INSPECT_HEADERS
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: inspect-headers }
+            - name: EBFW_INSPECT_BODY
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: inspect-body }
           volumeMounts:
+            - name: config
+              mountPath: /etc/ebfw
+              readOnly: true
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
@@ -56,6 +101,9 @@ spec:
               mountPath: /sys/fs/bpf
               mountPropagation: HostToContainer
       volumes:
+        - name: config
+          configMap:
+            name: ebfw-config
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup

@@ -24,12 +24,12 @@ func clientHello(sni string) []byte {
 	exts := []byte{byte(len(ext) >> 8), byte(len(ext))}
 	exts = append(exts, ext...)
 
-	hs := []byte{0x03, 0x03} // client_version TLS 1.2
-	hs = append(hs, make([]byte, 32)...) // random
-	hs = append(hs, 0x00)                // session_id length
+	hs := []byte{0x03, 0x03}                // client_version TLS 1.2
+	hs = append(hs, make([]byte, 32)...)    // random
+	hs = append(hs, 0x00)                   // session_id length
 	hs = append(hs, 0x00, 0x02, 0x00, 0x2f) // cipher_suites
-	hs = append(hs, 0x01, 0x00)          // compression methods
-	hs = append(hs, exts...)             // extensions
+	hs = append(hs, 0x01, 0x00)             // compression methods
+	hs = append(hs, exts...)                // extensions
 
 	handshake := []byte{0x01} // ClientHello
 	handshake = append(handshake, byte(len(hs)>>16), byte(len(hs)>>8), byte(len(hs)))
