@@ -1,6 +1,7 @@
 .git
 bin/
+out/
 ebpf-skill/
 *.o
-bpf_bpfel.go
-bpf_bpfeb.go
+*_bpfel.go
+*_bpfeb.go
