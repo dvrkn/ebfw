@@ -143,13 +143,9 @@ func (p *Programmer) apply(eng policy.Engine) {
 		r := &rules[i]
 		act := actionByte(r.Action)
 
-		if len(r.Match.Pod.Labels) > 0 {
-			deferred++ // label selectors need informer label exposure (not yet wired)
-			continue
-		}
 		cgs := matchCgroups(r.Match.Pod, pods)
 		if len(cgs) == 0 {
-			continue // selector matches no current pod
+			continue // selector matches no current pod (or labels not yet synced)
 		}
 
 		hasCIDR := len(r.Match.CIDRs) > 0
@@ -191,7 +187,7 @@ func (p *Programmer) apply(eng policy.Engine) {
 	metrics.PolicyRules.Set(float64(len(rules)))
 	if deferred > 0 {
 		log.Printf("ebfw enforce: %d policy dimension(s) not enforceable at the cgroup datapath yet "+
-			"(domain/L7 need DNS learning or the proxy; port-only, IPv6, CIDR+port and label selectors are deferred) "+
+			"(domain/L7 need DNS learning or the proxy; port-only, IPv6 and CIDR+port are deferred) "+
 			"— still evaluated for log/metrics", deferred)
 	}
 }
@@ -259,8 +255,11 @@ func (p *Programmer) reconcile(newCIDR map[string]struct{}, newVerdict map[verdi
 }
 
 // matchCgroups returns the cgroup ids whose pod matches the selector. An empty
-// selector is node-global (cgroup id 0). Label selectors are handled by the
-// caller (not yet wired).
+// selector is node-global (cgroup id 0). Identity dimensions (namespace/name/uid)
+// and label requirements (matchLabels + matchExpressions, including a folded
+// policy-level subject selector) are matched against the resolved PodInfo. Pods
+// whose labels haven't been enriched yet simply don't match until the next
+// re-walk picks them up.
 func matchCgroups(sel policy.PodSelector, pods map[uint64]attr.PodInfo) []uint64 {
 	if sel.IsZero() {
 		return []uint64{0}
@@ -274,6 +273,9 @@ func matchCgroups(sel policy.PodSelector, pods map[uint64]attr.PodInfo) []uint64
 			continue
 		}
 		if sel.UID != "" && sel.UID != info.UID {
+			continue
+		}
+		if !sel.MatchesLabels(info.Labels) {
 			continue
 		}
 		out = append(out, cg)

@@ -180,10 +180,16 @@ CRDs in `ebfw.dvrkn.com/v1`, cluster-wide:
 - **`ClusterEgressPolicy`** (cluster-scoped) — **node-wide** rules and the only
   place that can set a node-global default-deny.
 
+Either kind has a required top-level **`spec.podSelector`** (a NetworkPolicy-style
+label selector; `{}` means "all pods in scope") that scopes the whole policy —
+rules **and** `defaultAction` — to a labeled subset of pods, so a
+`defaultAction: Deny` can lock down just `app=frontend` and leave the rest of the
+namespace/node alone.
+
 The agent aggregates every policy on the node (cluster rules first, then
-per-namespace rules, then per-namespace default-deny catch-alls) into the same
-engine + datapath used by the file source — so enforcement behaviour is
-identical, only the source differs. A thin control-plane **operator** validates
+per-namespace rules, then default-deny catch-alls), folding each policy's
+`podSelector` into its rules, into the same engine + datapath used by the file
+source — so enforcement behaviour is identical, only the source differs. A thin control-plane **operator** validates
 each resource and records `status.conditions[Accepted]`; it does not program the
 datapath (the per-node agents do). An invalid resource is dropped (and marked
 `Accepted=False`) without affecting the others.
