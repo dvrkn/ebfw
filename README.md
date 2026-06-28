@@ -314,6 +314,25 @@ sudo ./test/e2e.sh out/ebfw
   pushed to ghcr.io by CI. Scaffolded with kubebuilder; controllers covered by
   envtest. _Deferred: pinned maps + an external map-programming controller (the
   per-node agent programs its own maps for now)._
+- **Stage 3.1 — operator hardening (next):** broaden coverage and smooth the
+  rough edges now that the happy path is proven.
+  - _e2e coverage:_ lifecycle (hot-reload an edited CR → new rule applies live;
+    CR deletion lifts enforcement; an invalid CR is dropped while the rest keep
+    enforcing); aggregation interactions (cluster `defaultAction: Deny` allowlist
+    that keeps DNS/API up, multiple `EgressPolicy` across namespaces,
+    cluster+namespace precedence); more dimensions (domain **deny** via CRD,
+    `log` mode via CRD, and negative checks that deferred dims —
+    port-only / IPv6 / label-selector — are logged-not-dropped).
+  - _crdsource + agent:_ coalesce/debounce informer rebuilds, watch-error
+    resilience, optional node-scoped watch (only namespaces with local pods), and
+    surface the deferred-dimension count (rules that couldn't be programmed) as a
+    metric/log.
+  - _operator UX:_ emit Kubernetes Events on validation failure, operator metrics
+    (policy / validation-failure counts), and evaluate a validating admission
+    webhook for synchronous rejection instead of post-hoc `Accepted=False`.
+  - _CRD / chart polish:_ CEL field validations (`Modify` ⇒ mutations, action
+    required), an Age print column, and Helm values for operator probes/resources;
+    note the agent binary now links controller-runtime (size bump).
 - **Stage 4 — hardening:** TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, IPv6
   extension-header parsing + enforcement, cgroup-v1 fallback, request-body
   inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI, HA, scale
