@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// ebfw egress monitor (Stage-0 PoC).
+// ebfw egress monitor + enforcement datapath.
 //
-// A cgroup_skb/egress program. Attached at the node's root cgroup v2 it sees
-// every egress packet from every pod on the node. It does NO protocol parsing
-// itself: it bounds-checks, classifies the packet, and copies the relevant
-// bytes up to userspace via a ring buffer. All DNS/TLS/HTTP parsing happens in
-// Go where loops and string handling are safe.
+// Three programs sharing one object so they share the verdict maps:
+//   cgroup_skb/egress    classify egress packets (+ drop denied flows)
+//   cgroup_skb/ingress   capture DNS answers for domain→IP learning
+//   cgroup/connect4      fail denied IPv4 TCP connect() with EPERM
+//
+// Attached at the node's root cgroup v2, the egress program sees every egress
+// packet from every pod on the node. It does NO protocol parsing itself: it
+// bounds-checks, classifies the packet, and copies the relevant bytes up to
+// userspace via a ring buffer. All DNS/TLS/HTTP parsing happens in Go where
+// loops and string handling are safe.
 //
 // Event kinds emitted:
 //   EVT_CONNECT  new TCP connection (SYN & !ACK)        -> dst ip:port
@@ -34,6 +39,11 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PAYLOAD 512
 
+// Enforcement verdicts. These are the map *values*; they are also the
+// SK_DROP/SK_PASS return codes, so ACTION_DENY must stay 0 and ACTION_ALLOW 1.
+#define ACTION_DENY  0
+#define ACTION_ALLOW 1
+
 // Force the compiler to keep a value in a single register so the verifier's
 // bound on it isn't lost to a decoupled copy (a common variable-length copy
 // pitfall). See libbpf's bpf_helpers.h barrier_var().
@@ -47,7 +57,7 @@ struct event {
 	__u8  evt_type;     // off 0   EVT_*
 	__u8  ip_version;   // off 1   4 (IPv6 is a later stage)
 	__u8  l4_proto;     // off 2   IPPROTO_TCP / IPPROTO_UDP
-	__u8  _pad;         // off 3
+	__u8  action;       // off 3   enforcement verdict: ACTION_ALLOW / ACTION_DENY
 	__be32 saddr;       // off 4   network byte order
 	__be32 daddr;       // off 8   network byte order
 	__be16 sport;       // off 12  network byte order
@@ -63,11 +73,173 @@ struct {
 	__uint(max_entries, 1 << 18); // 256 KiB
 } events SEC(".maps");
 
+// DNS answers captured on ingress for domain→IP learning. Mirrored by hand in
+// internal/enforce/dnslearn.go: payload_len@0 _pad@4 cgroup_id@8 payload@16.
+struct dns_answer {
+	__u32 payload_len;          // off 0
+	__u32 _pad;                 // off 4
+	__u64 cgroup_id;            // off 8  receiving socket's cgroup = querying pod
+	__u8  payload[MAX_PAYLOAD]; // off 16
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 18); // 256 KiB
+} dns_answers SEC(".maps");
+
+// ── Enforcement maps ────────────────────────────────────────────────────────
+// Programmed in-process by the userspace Programmer (which holds the map
+// handles), so no pinning is needed: policy updates re-apply without a program
+// reload. Pinning these (LIBBPF_PIN_BY_NAME) would let an external CRD
+// controller update them without a reload; not done yet. The connect4 and
+// DNS-learning programs live in this same object to share the maps natively.
+// Key/value layouts are mirrored in internal/enforce (hand-written Go structs);
+// change both in lockstep.
+//
+// verdict_for() consults them most-specific first: exact (cgroup,ip,port) →
+// (cgroup,ip,any) → (global,ip,port) → (global,ip,any) → CIDR(cgroup) →
+// CIDR(global) → default_action(cgroup) → default_action(global) → ALLOW. The
+// userspace Programmer computes each entry's value with the full policy engine,
+// so per-IP entries are always faithful to rule order; CIDR ranges carry their
+// rule's verdict.
+
+// verdict_key: exact destination. dport == 0 means "any port".
+struct verdict_key {
+	__u64  cgroup_id; // 0 = node-global (applies to every pod)
+	__be32 daddr;     // network byte order
+	__be16 dport;     // network byte order; 0 = any
+	__u16  _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH); // LRU so DNS-learned IPs self-evict
+	__uint(max_entries, 1 << 16);        // 65536
+	__type(key, struct verdict_key);
+	__type(value, __u8);
+} verdicts SEC(".maps");
+
+// cidr_key: LPM trie key. The matched bitstring after prefixlen is
+// cgroup_id(8B) || addr(4B); a /n CIDR for one cgroup is prefixlen 64+n, a
+// node-global one uses cgroup_id 0 (still 64 significant bits) so the two never
+// collide. Port-agnostic. Packed so the data starts immediately after prefixlen
+// with no alignment padding (LPM matches the raw byte string).
+struct cidr_key {
+	__u32  prefixlen;
+	__u64  cgroup_id;
+	__be32 addr;
+} __attribute__((packed));
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, 1 << 14);
+	__type(key, struct cidr_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC); // required for LPM_TRIE
+} cidr_verdicts SEC(".maps");
+
+// default_action: posture per cgroup id; key 0 is the node-global default.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, __u8);
+} default_action SEC(".maps");
+
+// enforce_cfg: single-entry runtime config. dry_run != 0 makes verdict_for
+// compute + stamp the action but never drop (high-fidelity canary).
+struct enforce_cfg_val {
+	__u8 enabled; // 0 = no enforcement programmed (skip lookups, always allow)
+	__u8 dry_run; // 1 = compute verdicts but never SK_DROP
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct enforce_cfg_val);
+} enforce_cfg SEC(".maps");
+
+// enforce_enabled reports whether policy maps have been programmed; dry is set
+// to the dry-run flag. When disabled, verdict_for is skipped entirely so the
+// observe-only path keeps its original cost.
+static __always_inline int enforce_enabled(__u8 *dry)
+{
+	__u32 k = 0;
+	struct enforce_cfg_val *c = bpf_map_lookup_elem(&enforce_cfg, &k);
+	if (!c || !c->enabled)
+		return 0;
+	*dry = c->dry_run;
+	return 1;
+}
+
+// verdict_for resolves the action for a destination, most-specific first.
+static __always_inline __u8 verdict_for(__u64 cg, __be32 daddr, __be16 dport)
+{
+	__u8 *v;
+	struct verdict_key vk = {};
+
+	vk.cgroup_id = cg;
+	vk.daddr = daddr;
+	vk.dport = dport;
+	v = bpf_map_lookup_elem(&verdicts, &vk);
+	if (v)
+		return *v;
+
+	vk.dport = 0; // (cgroup, ip, any-port)
+	v = bpf_map_lookup_elem(&verdicts, &vk);
+	if (v)
+		return *v;
+
+	vk.cgroup_id = 0; // (global, ip, port)
+	vk.dport = dport;
+	v = bpf_map_lookup_elem(&verdicts, &vk);
+	if (v)
+		return *v;
+
+	vk.dport = 0; // (global, ip, any-port)
+	v = bpf_map_lookup_elem(&verdicts, &vk);
+	if (v)
+		return *v;
+
+	struct cidr_key ck = {};
+	ck.prefixlen = 64 + 32;
+	ck.cgroup_id = cg; // CIDR for this cgroup
+	ck.addr = daddr;
+	v = bpf_map_lookup_elem(&cidr_verdicts, &ck);
+	if (v)
+		return *v;
+
+	ck.cgroup_id = 0; // node-global CIDR
+	v = bpf_map_lookup_elem(&cidr_verdicts, &ck);
+	if (v)
+		return *v;
+
+	v = bpf_map_lookup_elem(&default_action, &cg);
+	if (v)
+		return *v;
+
+	__u64 zero = 0;
+	v = bpf_map_lookup_elem(&default_action, &zero);
+	if (v)
+		return *v;
+
+	return ACTION_ALLOW;
+}
+
+// verdict_pass maps an action to the cgroup_skb return code, honouring dry-run.
+static __always_inline int verdict_pass(__u8 action, __u8 dry)
+{
+	if (action == ACTION_DENY && !dry)
+		return 0; // SK_DROP
+	return 1;         // SK_PASS
+}
+
 static __always_inline void submit_event(struct __sk_buff *skb,
 					 struct iphdr *iph,
 					 __u8 evt_type, __u8 proto,
 					 __be16 sport, __be16 dport,
-					 __u32 payload_off, __u32 payload_avail)
+					 __u32 payload_off, __u32 payload_avail,
+					 __u8 action)
 {
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -76,7 +248,7 @@ static __always_inline void submit_event(struct __sk_buff *skb,
 	e->evt_type   = evt_type;
 	e->ip_version = 4;
 	e->l4_proto   = proto;
-	e->_pad       = 0;
+	e->action     = action;
 	e->saddr      = iph->saddr;
 	e->daddr      = iph->daddr;
 	e->sport      = sport;
@@ -145,18 +317,31 @@ int egress(struct __sk_buff *skb)
 	if (l4 > data_end)
 		return 1;
 
+	// Resolve the enforcement verdict once per packet. When no policy is
+	// programmed this is a single array lookup and we keep the observe-only
+	// cost: act stays ACTION_ALLOW and nothing is dropped.
+	__u8 dry = 0;
+	int enf = enforce_enabled(&dry);
+	__u64 cg = enf ? bpf_skb_cgroup_id(skb) : 0;
+
 	if (iph->protocol == IPPROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return 1;
 
 		if (udp->dest == bpf_htons(53)) {
-			// Use skb->len (covers non-linear data) rather than
-			// data_end (linear head only) for the payload length.
+			// DNS is ALWAYS permitted — under default-deny, dropping it
+			// would break name resolution and thus all egress. Use
+			// skb->len (covers non-linear data) for the payload length.
 			__u32 off = ihl + sizeof(*udp);
 			__u32 avail = (off < skb->len) ? (skb->len - off) : 0;
 			submit_event(skb, iph, EVT_DNS, IPPROTO_UDP,
-				     udp->source, udp->dest, off, avail);
+				     udp->source, udp->dest, off, avail, ACTION_ALLOW);
+			return 1;
+		}
+		if (enf) {
+			__u8 act = verdict_for(cg, iph->daddr, udp->dest);
+			return verdict_pass(act, dry);
 		}
 		return 1;
 	}
@@ -166,14 +351,17 @@ int egress(struct __sk_buff *skb)
 		if ((void *)(tcp + 1) > data_end)
 			return 1;
 
-		// New connection: SYN set, ACK clear. No payload to copy.
+		__u8 act = enf ? verdict_for(cg, iph->daddr, tcp->dest) : ACTION_ALLOW;
+
+		// New connection: SYN set, ACK clear. No payload to copy. Emit the
+		// event (with its verdict) before any drop so denials are visible.
 		if (tcp->syn && !tcp->ack)
 			submit_event(skb, iph, EVT_CONNECT, IPPROTO_TCP,
-				     tcp->source, tcp->dest, 0, 0);
+				     tcp->source, tcp->dest, 0, 0, act);
 
 		__u32 doff = tcp->doff * 4;
 		if (doff < sizeof(*tcp))
-			return 1;
+			return verdict_pass(act, dry);
 
 		// The TCP payload is often in the skb's non-linear (paged) part on
 		// egress, so direct packet access (data/data_end) can't see it.
@@ -181,25 +369,128 @@ int egress(struct __sk_buff *skb)
 		// and bounds against skb->len.
 		__u32 off = ihl + doff;
 		if (off >= skb->len)
-			return 1; // no payload (pure ACK, etc.)
+			return verdict_pass(act, dry); // no payload (pure ACK, etc.)
 		__u32 avail = skb->len - off;
 		if (avail < 6)
-			return 1; // need 6 bytes to classify
+			return verdict_pass(act, dry); // need 6 bytes to classify
 
 		__u8 hdr[6];
 		if (bpf_skb_load_bytes(skb, off, hdr, sizeof(hdr)) != 0)
-			return 1;
+			return verdict_pass(act, dry);
 
 		if (hdr[0] == 0x16 && hdr[5] == 0x01) {
 			// TLS handshake record carrying a ClientHello.
 			submit_event(skb, iph, EVT_TLS, IPPROTO_TCP,
-				     tcp->source, tcp->dest, off, avail);
+				     tcp->source, tcp->dest, off, avail, act);
 		} else if (looks_like_http(hdr[0], hdr[1], hdr[2], hdr[3])) {
 			submit_event(skb, iph, EVT_HTTP, IPPROTO_TCP,
-				     tcp->source, tcp->dest, off, avail);
+				     tcp->source, tcp->dest, off, avail, act);
 		}
-		return 1;
+		return verdict_pass(act, dry);
 	}
 
+	return 1;
+}
+
+// dns_ingress captures DNS answers (UDP source port 53) so userspace can learn
+// domain→IP mappings and program per-pod verdicts for domain rules.
+// The receiving socket's cgroup attributes the answer to the querying pod. It
+// never drops — DNS answers are always delivered.
+SEC("cgroup_skb/ingress")
+int dns_ingress(struct __sk_buff *skb)
+{
+	void *data     = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	struct iphdr *iph = data;
+	if ((void *)(iph + 1) > data_end)
+		return 1;
+	if (iph->version != 4)
+		return 1;
+
+	__u32 ihl = iph->ihl * 4;
+	if (ihl < sizeof(*iph))
+		return 1;
+
+	void *l4 = (void *)iph + ihl;
+	if (l4 > data_end)
+		return 1;
+
+	if (iph->protocol != IPPROTO_UDP)
+		return 1;
+	struct udphdr *udp = l4;
+	if ((void *)(udp + 1) > data_end)
+		return 1;
+	if (udp->source != bpf_htons(53)) // answers come FROM port 53
+		return 1;
+
+	__u32 off = ihl + sizeof(*udp);
+	__u32 avail = (off < skb->len) ? (skb->len - off) : 0;
+
+	struct dns_answer *e = bpf_ringbuf_reserve(&dns_answers, sizeof(*e), 0);
+	if (!e)
+		return 1;
+	e->cgroup_id   = bpf_skb_cgroup_id(skb);
+	e->_pad        = 0;
+	e->payload_len = 0;
+
+	__u64 n = avail;
+	if (n > MAX_PAYLOAD)
+		n = MAX_PAYLOAD;
+	barrier_var(n);
+	if (n != 0) {
+		barrier_var(n);
+		if (bpf_skb_load_bytes(skb, off, e->payload, n) == 0)
+			e->payload_len = (__u32)n;
+	}
+	bpf_ringbuf_submit(e, 0);
+	return 1;
+}
+
+// emit_connect_deny reports a connect()-time denial on the events ringbuf. The
+// SYN never leaves on a deny, so the egress hook won't see this connection —
+// this keeps denied connects visible (saddr/sport are unknown at connect time).
+static __always_inline void emit_connect_deny(__u64 cg, __be32 daddr, __be16 dport)
+{
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return;
+	e->evt_type    = EVT_CONNECT;
+	e->ip_version  = 4;
+	e->l4_proto    = IPPROTO_TCP;
+	e->action      = ACTION_DENY;
+	e->saddr       = 0;
+	e->daddr       = daddr;
+	e->sport       = 0;
+	e->dport       = dport;
+	e->payload_len = 0;
+	e->_pad2       = 0;
+	e->cgroup_id   = cg;
+	bpf_ringbuf_submit(e, 0);
+}
+
+// connect4 fails a TCP connect() to a denied IPv4 destination with -EPERM — a
+// clean, immediate failure versus the SYN-timeout the egress drop produces. It
+// consults the same verdict maps (including DNS-learned IPs). UDP, including
+// DNS, is left to the egress hook (which always permits udp:53), so name
+// resolution under default-deny is never broken here.
+SEC("cgroup/connect4")
+int connect4(struct bpf_sock_addr *ctx)
+{
+	if (ctx->protocol != IPPROTO_TCP)
+		return 1;
+	__u8 dry = 0;
+	if (!enforce_enabled(&dry))
+		return 1;
+
+	__u64 cg = bpf_get_current_cgroup_id();
+	__be32 daddr = ctx->user_ip4;       // network byte order
+	__be16 dport = (__u16)ctx->user_port; // low 16 bits are the be16 port
+
+	if (verdict_for(cg, daddr, dport) == ACTION_DENY) {
+		emit_connect_deny(cg, daddr, dport);
+		if (!dry)
+			return 0; // -EPERM
+	}
 	return 1;
 }

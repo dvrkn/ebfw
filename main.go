@@ -9,6 +9,11 @@
 //   - filtering of internal domains/IPs comes from a YAML file (-config / EBFW_CONFIG)
 //   - inspection depth comes from environment variables (set via a ConfigMap):
 //     EBFW_INSPECT_PATHS (default on), EBFW_INSPECT_HEADERS, EBFW_INSPECT_BODY (stub)
+//   - egress enforcement is off by default; EBFW_ENFORCE_MODE
+//     (off|log|enforce) + EBFW_POLICY (policy YAML path) enable it.
+//
+// The `ebfw policy test` subcommand evaluates a policy file against sample flows
+// without touching the kernel.
 package main
 
 import (
@@ -23,15 +28,24 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 
 	"github.com/dvrkn/ebfw/internal/attr"
+	"github.com/dvrkn/ebfw/internal/cli"
 	"github.com/dvrkn/ebfw/internal/config"
 	"github.com/dvrkn/ebfw/internal/egress"
+	"github.com/dvrkn/ebfw/internal/enforce"
 	"github.com/dvrkn/ebfw/internal/metrics"
 	"github.com/dvrkn/ebfw/internal/output"
+	"github.com/dvrkn/ebfw/internal/policy"
 	"github.com/dvrkn/ebfw/internal/sslsnoop"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+
+	// Subcommands run before any eBPF/kernel setup so they work anywhere
+	// (no root, no Linux): `ebfw policy test ...` evaluates a policy file.
+	if len(os.Args) > 1 && os.Args[1] == "policy" {
+		os.Exit(cli.PolicyMain(os.Args[2:]))
+	}
 
 	cfgPath := flag.String("config", os.Getenv("EBFW_CONFIG"), "path to YAML config file (or env EBFW_CONFIG)")
 	flag.Parse()
@@ -65,11 +79,17 @@ func main() {
 	resolver := attr.NewResolver(cfg.Cgroup, enricher)
 	defer resolver.Close()
 
-	sink := output.New(cfg.Output)
+	baseSink := output.New(cfg.Output)
 	go metrics.Serve(cfg.MetricsAddr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Egress enforcement: wrap the output sink so events carry their
+	// policy verdict. Observe-only unless EBFW_ENFORCE_MODE is log or enforce.
+	// kernelSrc is non-nil only in enforce mode, where egress programs the
+	// cgroup drop datapath from it.
+	sink, kernelSrc := setupEnforcement(ctx, cfg, baseSink)
 
 	var wg sync.WaitGroup
 
@@ -91,11 +111,56 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := egress.Run(ctx, cfg, filter, resolver, sink); err != nil {
+		if err := egress.Run(ctx, cfg, filter, resolver, sink, kernelSrc); err != nil {
 			log.Printf("ebfw: monitor stopped: %v", err)
 			stop()
 		}
 	}()
 
 	wg.Wait()
+}
+
+// setupEnforcement wraps the output sink with policy evaluation when
+// enforcement is enabled. It returns the wrapped sink and, in enforce mode, the
+// PolicySource that egress uses to program the cgroup drop datapath (nil
+// otherwise). Loading is best-effort: mode=off or a missing policy keeps the
+// agent observe-only; an explicitly invalid policy file (or bad mode) is fatal
+// so misconfiguration is loud rather than silently ignored.
+func setupEnforcement(ctx context.Context, cfg *config.Config, inner output.Sink) (output.Sink, policy.PolicySource) {
+	mode := cfg.Enforce.Mode
+	if mode == "" || mode == "off" {
+		if cfg.Enforce.PolicyPath != "" {
+			log.Printf("ebfw: enforcement off (observe-only); set EBFW_ENFORCE_MODE=log|enforce to apply %s", cfg.Enforce.PolicyPath)
+		}
+		return inner, nil
+	}
+	if mode != "log" && mode != "enforce" {
+		log.Fatalf("ebfw: invalid EBFW_ENFORCE_MODE %q (want off, log, or enforce)", mode)
+	}
+
+	var src policy.PolicySource
+	if cfg.Enforce.PolicyPath == "" {
+		log.Printf("ebfw: enforcement mode=%s but no EBFW_POLICY; using empty allow-all policy", mode)
+		src = policy.EmptySource()
+	} else {
+		s, err := policy.NewFileSource(cfg.Enforce.PolicyPath)
+		if err != nil {
+			log.Fatalf("ebfw: %v", err)
+		}
+		src = s
+	}
+
+	s, err := enforce.NewSink(ctx, src, mode, inner)
+	if err != nil {
+		log.Fatalf("ebfw: %v", err)
+	}
+	p := src.Snapshot()
+	log.Printf("ebfw: enforcement %s — %d rules, default %s, policy=%q",
+		mode, len(p.Rules), p.EffectiveDefault(), cfg.Enforce.PolicyPath)
+
+	// Only enforce mode programs the kernel datapath. Log mode is userspace-only.
+	if mode == "enforce" {
+		return s, src
+	}
+	return s, nil
 }
