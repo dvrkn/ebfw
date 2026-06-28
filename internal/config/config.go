@@ -40,6 +40,10 @@ type Enforcement struct {
 	// annotate events, no drops), or "enforce" (drop denied egress at the
 	// kernel datapath). EBFW_ENFORCE_MODE.
 	Mode string
+	// Source selects where the policy comes from: "file" (default; the YAML at
+	// PolicyPath, used off-cluster and for the host e2e) or "crd" (watch the
+	// EgressPolicy + ClusterEgressPolicy CRDs in-cluster). EBFW_POLICY_SOURCE.
+	Source string
 	// PolicyPath is the path to the policy YAML file. EBFW_POLICY.
 	PolicyPath string
 	// PinPath is the bpffs directory for pinned enforcement maps, so an external
@@ -55,6 +59,7 @@ type Enforcement struct {
 func EnforcementFromEnv() Enforcement {
 	return Enforcement{
 		Mode:       strings.ToLower(envStr("EBFW_ENFORCE_MODE", "off")),
+		Source:     strings.ToLower(envStr("EBFW_POLICY_SOURCE", "file")),
 		PolicyPath: strings.TrimSpace(os.Getenv("EBFW_POLICY")),
 		PinPath:    envStr("EBFW_BPF_PIN_PATH", "/sys/fs/bpf/ebfw"),
 		DryRun:     envBool("EBFW_ENFORCE_DRY_RUN", false),

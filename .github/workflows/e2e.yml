@@ -3,10 +3,18 @@ name: e2e
 on:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
+
+# Cancel superseded in-flight runs for the same PR/branch, but never cancel a
+# push/tag run — those can reach the release job, and cancelling mid-publish
+# could leave a partial multi-arch image manifest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   e2e:
@@ -34,17 +42,36 @@ jobs:
           go build -trimpath -o bin/ebfw .
 
       - name: Unit tests
-        run: go test ./...
+        # The controller package needs envtest binaries; it is covered by the
+        # operator-test job. Everything else (incl. the policy aggregation +
+        # CRD conversion tests) runs here.
+        run: go test $(go list ./... | grep -v 'ebfw/internal/controller')
 
       - name: End-to-end test (eBPF; needs root)
         run: sudo ./test/e2e.sh bin/ebfw
 
+  operator-test:
+    # Control-plane tests: CRD codegen + the controllers under envtest. Pure Go,
+    # no eBPF and no root, so this is the fast feedback loop for the operator.
+    runs-on: ubuntu-24.04
+    env:
+      GOFLAGS: -mod=mod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Operator tests (controller-gen + envtest)
+        run: make test-operator
+
   k8s:
     # Full Kubernetes e2e: deploy to a throwaway k3d cluster and assert pod
-    # attribution (DNS/TLS/HTTP/HTTPS), metrics, and JSON output. The image is
-    # built inside Docker by the script, so no Go/clang toolchain is needed here.
+    # attribution (DNS/TLS/HTTP/HTTPS), metrics, JSON output, and CRD-driven
+    # enforcement. The image is built inside Docker by the script.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -54,3 +81,86 @@ jobs:
 
       - name: Kubernetes e2e (k3d)
         run: ./test/k8s.sh
+
+  crd-e2e:
+    # Stage-3 CRD e2e: installs the Helm chart (CRDs + operator + agent watching
+    # the CRDs in enforce mode) and asserts operator status, CRD-driven denies,
+    # the namespaced default-deny semantic, and ClusterEgressPolicy node-wide deny.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d + helm
+        # kubectl and jq are preinstalled on ubuntu-24.04 runners.
+        run: |
+          curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | sudo bash
+          curl -sfL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash
+
+      - name: CRD e2e (k3d + Helm)
+        run: ./test/crd.sh
+
+  release:
+    # Publish multi-arch images to ghcr.io after every test job passes, on
+    # main/master pushes and version tags. Uses GITHUB_TOKEN (packages:write),
+    # which works regardless of which account the gh CLI is authed as.
+    needs: [e2e, operator-test, k8s, crd-e2e]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata (agent)
+        id: meta-agent
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ebfw
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-agent.outputs.tags }}
+          labels: ${{ steps.meta-agent.outputs.labels }}
+
+      - name: Metadata (operator)
+        id: meta-operator
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ebfw-operator
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push operator
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-operator.outputs.tags }}
+          labels: ${{ steps.meta-operator.outputs.labels }}

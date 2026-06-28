@@ -1,0 +1,6 @@
+.DS_Store
+.git/
+*.tmpl.bak
+*.swp
+*.bak
+*~

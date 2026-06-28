@@ -1,0 +1,28 @@
+apiVersion: ebfw.dvrkn.com/v1
+kind: ClusterEgressPolicy
+metadata:
+  name: block-known-bad
+spec:
+  # Node-wide blocklist: allow by default, deny only the rules below. This is
+  # the safe cluster-scoped pattern (it never cuts off the node).
+  defaultAction: Allow
+  rules:
+    - name: block-metadata-service
+      action: Deny
+      match:
+        cidrs: ["169.254.169.254/32"]
+    - name: block-smtp-everywhere
+      action: Deny
+      match:
+        ports: [25, 465, 587]
+# DANGER: a node-wide allowlist (defaultAction: Deny) cuts off ALL egress on
+# every node unless explicitly allowed. If you use it, allow DNS, the API
+# server, and image registries first:
+#   defaultAction: Deny
+#   rules:
+#     - name: allow-dns
+#       action: Allow
+#       match: { ports: [53] }
+#     - name: allow-apiserver
+#       action: Allow
+#       match: { cidrs: ["10.43.0.1/32"], ports: [443] }   # your cluster API VIP
