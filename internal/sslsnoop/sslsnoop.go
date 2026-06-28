@@ -24,14 +24,18 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 
+	"github.com/dvrkn/ebfw/internal/attr"
 	"github.com/dvrkn/ebfw/internal/config"
 	"github.com/dvrkn/ebfw/internal/l7"
+	"github.com/dvrkn/ebfw/internal/metrics"
+	"github.com/dvrkn/ebfw/internal/output"
 )
 
 const (
 	commLen = 16
-	// event header in bpf/sslsnoop.bpf.c: pid(4) + data_len(4) + comm(16) + ssl(8)
-	hdrLen = 4 + 4 + commLen + 8
+	// event header in bpf/sslsnoop.bpf.c, mirrored field-by-field:
+	// pid(4) + data_len(4) + comm(16) + ssl(8) + cgroup_id(8) = 40.
+	hdrLen = 4 + 4 + commLen + 8 + 8
 
 	// discoverInterval is how often we scan for newly-appeared container
 	// libraries. It does NOT affect request capture (always live once attached).
@@ -42,9 +46,10 @@ const (
 )
 
 // Run loads the SSL_write uprobe, auto-discovers and attaches to each container's
-// libssl, and reports filtered HTTPS requests until ctx is cancelled. The caller
-// owns rlimit setup and signal handling.
-func Run(ctx context.Context, cfg *config.Config, filter *config.Filter) error {
+// libssl, and reports filtered HTTPS requests until ctx is cancelled, attributing
+// each to its pod via resolver and emitting through sink. The caller owns rlimit
+// setup and signal handling.
+func Run(ctx context.Context, cfg *config.Config, filter *config.Filter, resolver *attr.Resolver, sink output.Sink) error {
 	var objs sslObjects
 	if err := loadSslObjects(&objs, nil); err != nil {
 		var ve *ebpf.VerifierError
@@ -69,7 +74,7 @@ func Run(ctx context.Context, cfg *config.Config, filter *config.Filter) error {
 	go discoverLoop(ctx, objs.SslWrite)
 	log.Printf("ebfw sslsnoop: auto-discovering libssl across the node (live capture)")
 
-	t := newTracker(filter, cfg.Inspect)
+	t := newTracker(filter, cfg.Inspect, resolver, sink)
 	for {
 		rec, err := rd.Read()
 		if err != nil {
@@ -101,13 +106,15 @@ type connState struct {
 // handling both HTTP/1.x (line-based) and HTTP/2 (frames + HPACK, which is
 // stateful across requests on a connection).
 type tracker struct {
-	conns   map[uint64]*connState
-	filter  *config.Filter
-	inspect config.Inspection
+	conns    map[uint64]*connState
+	filter   *config.Filter
+	inspect  config.Inspection
+	resolver *attr.Resolver
+	sink     output.Sink
 }
 
-func newTracker(f *config.Filter, in config.Inspection) *tracker {
-	return &tracker{conns: map[uint64]*connState{}, filter: f, inspect: in}
+func newTracker(f *config.Filter, in config.Inspection, resolver *attr.Resolver, sink output.Sink) *tracker {
+	return &tracker{conns: map[uint64]*connState{}, filter: f, inspect: in, resolver: resolver, sink: sink}
 }
 
 func (t *tracker) handle(buf []byte) {
@@ -118,6 +125,7 @@ func (t *tracker) handle(buf []byte) {
 	dlen := binary.LittleEndian.Uint32(buf[4:8])
 	comm := cstr(buf[8 : 8+commLen])
 	ssl := binary.LittleEndian.Uint64(buf[24:32])
+	cgroupID := binary.LittleEndian.Uint64(buf[32:40])
 
 	if dlen == 0 || hdrLen+int(dlen) > len(buf) {
 		return
@@ -139,34 +147,40 @@ func (t *tracker) handle(buf []byte) {
 			c.mode = modeHTTP2
 			c.h2 = l7.NewH2Conn()
 			for _, r := range c.h2.Feed(data) {
-				t.emit(pid, comm, r)
+				t.emit(pid, comm, cgroupID, r)
 			}
 		} else if r, ok := l7.ParseRequest(data); ok {
 			c.mode = modeHTTP1
-			t.emit(pid, comm, r)
+			t.emit(pid, comm, cgroupID, r)
 		} else {
 			c.mode = modeIgnore // not HTTP, or joined mid-stream
 		}
 	case modeHTTP1:
 		if r, ok := l7.ParseRequest(data); ok {
-			t.emit(pid, comm, r)
+			t.emit(pid, comm, cgroupID, r)
 		}
 	case modeHTTP2:
 		for _, r := range c.h2.Feed(data) {
-			t.emit(pid, comm, r)
+			t.emit(pid, comm, cgroupID, r)
 		}
 	case modeIgnore:
 	}
 }
 
-func (t *tracker) emit(pid uint32, comm string, r *l7.Request) {
+func (t *tracker) emit(pid uint32, comm string, cgroupID uint64, r *l7.Request) {
 	if t.filter.SkipDomain(r.Host) {
+		metrics.FilteredTotal.WithLabelValues(string(output.KindHTTPS)).Inc()
 		return
 	}
-	fmt.Printf("HTTPS  [pid=%d %s] %s %s%s\n", pid, comm, r.Method, r.Host, r.Path)
-	if t.inspect.Headers {
-		l7.PrintHeaders(r.Headers)
+	ev := output.Event{
+		Kind: output.KindHTTPS, PID: int(pid), Comm: comm,
+		Method: r.Method, Domain: r.Host, Path: r.Path,
+		Pod: t.resolver.ByCgroupID(cgroupID),
 	}
+	if t.inspect.Headers {
+		ev.Headers = r.Headers
+	}
+	t.sink.Emit(ev)
 }
 
 // discoverLoop attaches an SSL_write uprobe to every unique libssl inode it has
@@ -204,6 +218,7 @@ func discoverLoop(ctx context.Context, prog *ebpf.Program) {
 			}
 			delete(failed, key)
 			attached[key] = up
+			metrics.UprobesAttached.Inc()
 			log.Printf("ebfw sslsnoop: attached SSL_write uprobe via %s [inode %s]", path, key)
 		}
 		select {

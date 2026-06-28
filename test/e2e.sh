@@ -20,7 +20,13 @@ HDR="X-Ebfw-Test: e2e-$$"
 
 log="$(mktemp)"
 cfg="$(mktemp)"
-cleanup() { kill "${AGENT:-}" 2>/dev/null; wait "${AGENT:-}" 2>/dev/null; rm -f "$log" "$cfg"; }
+metrics="$(mktemp)"
+jlog="$(mktemp)"
+cleanup() {
+  kill "${AGENT:-}" "${JAGENT:-}" 2>/dev/null
+  wait "${AGENT:-}" "${JAGENT:-}" 2>/dev/null
+  rm -f "$log" "$cfg" "$metrics" "$jlog"
+}
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: must run as root (eBPF)"; exit 1; }
@@ -41,11 +47,16 @@ AGENT=$!
 sleep 3   # allow cgroup attach + libssl uprobe discovery
 
 echo "# generating traffic"
-curl --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "http://${SHOWN}/e2e/http-path"   || true
-curl --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/https-path" || true
-curl          -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/h2-path"    || true  # HTTP/2 (curl default)
-curl --http1.1 -s -o /dev/null --max-time 10           "https://${HIDDEN}/e2e/should-be-filtered" || true
+# Force IPv4 (-4): the packet monitor is IPv4-only, so on dual-stack hosts the
+# TLS/HTTP/CONNECT checks need IPv4 egress (the uprobe is IP-agnostic regardless).
+curl -4 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "http://${SHOWN}/e2e/http-path"   || true
+curl -4 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/https-path" || true
+curl -4          -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/h2-path"    || true  # HTTP/2 (curl default)
+curl -4 --http1.1 -s -o /dev/null --max-time 10           "https://${HIDDEN}/e2e/should-be-filtered" || true
 sleep 2
+
+echo "# scraping metrics (:9090)"
+curl -s --max-time 5 "http://127.0.0.1:9090/metrics" > "$metrics" || true
 
 kill "$AGENT" 2>/dev/null; wait "$AGENT" 2>/dev/null; AGENT=""
 
@@ -54,8 +65,9 @@ cat "$log"
 echo "# -------------------------"
 
 fail=0
-present() { if grep -qE "$2" "$log"; then echo "PASS  $1"; else echo "FAIL  $1   [missing: $2]"; fail=1; fi; }
-absent()  { if grep -qE "$2" "$log"; then echo "FAIL  $1   [unexpected: $2]"; fail=1; else echo "PASS  $1"; fi; }
+present()    { if grep -qE "$2" "$log"; then echo "PASS  $1"; else echo "FAIL  $1   [missing: $2]"; fail=1; fi; }
+absent()     { if grep -qE "$2" "$log"; then echo "FAIL  $1   [unexpected: $2]"; fail=1; else echo "PASS  $1"; fi; }
+present_in() { if grep -qE "$3" "$1"; then echo "PASS  $2"; else echo "FAIL  $2   [missing: $3 in $1]"; fail=1; fi; }
 
 present "domain (DNS)"              "DNS .* ${SHOWN} "
 present "ssl (TLS SNI)"             "TLS .* ${SHOWN} "
@@ -64,6 +76,27 @@ present "path inspection (HTTPS/1.1)" "HTTPS .* GET ${SHOWN}/e2e/https-path"
 present "path inspection (HTTP/2)"    "HTTPS .* GET ${SHOWN}/e2e/h2-path"
 present "header inspection"           "${HDR}"
 absent  "internal filter (${HIDDEN})" "${HIDDEN}"
+present_in "$metrics" "metrics endpoint (ebfw_events_total)" "ebfw_events_total"
+
+# ---- JSON output smoke (separate pass; bare host has no pod, so we only assert
+#      structure, not attribution) ----
+echo "# ---- JSON output smoke ----"
+EBFW_CONFIG="$cfg" EBFW_INSPECT_PATHS=true EBFW_OUTPUT=json EBFW_METRICS_ADDR= \
+  "$BIN" > "$jlog" 2>&1 &
+JAGENT=$!
+sleep 3
+curl -4 --http1.1 -s -o /dev/null --max-time 10 "https://${SHOWN}/e2e/json-path" || true
+sleep 2
+kill "$JAGENT" 2>/dev/null; wait "$JAGENT" 2>/dev/null; JAGENT=""
+
+present_in "$jlog" "json output (https path)" '"kind":"https".*"path":"/e2e/json-path"'
+if command -v python3 >/dev/null 2>&1; then
+  if grep '^{' "$jlog" | python3 -c 'import sys,json;[json.loads(l) for l in sys.stdin]' 2>/dev/null; then
+    echo "PASS  json output (lines parse as JSON)"
+  else
+    echo "FAIL  json output (lines parse as JSON)"; fail=1
+  fi
+fi
 
 echo "# -------------------------"
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi
