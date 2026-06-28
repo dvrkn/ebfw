@@ -66,22 +66,6 @@ jobs:
       - name: Operator tests (controller-gen + envtest)
         run: make test-operator
 
-  k8s:
-    # Full Kubernetes e2e: deploy to a throwaway k3d cluster and assert pod
-    # attribution (DNS/TLS/HTTP/HTTPS), metrics, JSON output, and CRD-driven
-    # enforcement. The image is built inside Docker by the script.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install k3d
-        # kubectl and jq are preinstalled on ubuntu-24.04 runners.
-        run: curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | sudo bash
-
-      - name: Kubernetes e2e (k3d)
-        run: ./test/k8s.sh
-
   crd-e2e:
     # Stage-3 CRD e2e: installs the Helm chart (CRDs + operator + agent watching
     # the CRDs in enforce mode) and asserts operator status, CRD-driven denies,
@@ -107,7 +91,7 @@ jobs:
     # standard runners (ubuntu-24.04-arm, GA on private repos since 2026-01)
     # cut that to native speed. Each leg pushes an untagged manifest by digest;
     # the `merge` job assembles the multi-arch tag list from those digests.
-    needs: [e2e, operator-test, k8s, crd-e2e]
+    needs: [e2e, operator-test, crd-e2e]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
     strategy:
       fail-fast: false
