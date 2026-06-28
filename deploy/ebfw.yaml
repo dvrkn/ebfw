@@ -20,6 +20,30 @@ metadata:
   name: ebfw
   namespace: ebfw
 ---
+# Pod attribution: the agent watches Pods (scoped to its own node via a
+# spec.nodeName field selector) to map cgroup/pod UID -> namespace/name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ebfw
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ebfw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ebfw
+subjects:
+  - kind: ServiceAccount
+    name: ebfw
+    namespace: ebfw
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,6 +54,9 @@ data:
   inspect-paths: "true"     # capture HTTPS paths via SSL_write uprobe (essential)
   inspect-headers: "true"   # also print HTTP/HTTPS request headers
   inspect-body: "false"     # STUB: request-body capture (not implemented)
+  # Output + metrics.
+  output: "text"            # event format: text | json
+  metrics-addr: ":9090"     # Prometheus /metrics listen address ("" disables)
   config.yaml: |
     cgroup: /sys/fs/cgroup
     exclude:
@@ -81,6 +108,9 @@ spec:
           env:
             - name: EBFW_CONFIG
               value: /etc/ebfw/config.yaml
+            - name: EBFW_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
             - name: EBFW_INSPECT_PATHS
               valueFrom:
                 configMapKeyRef: { name: ebfw-config, key: inspect-paths }
@@ -90,6 +120,16 @@ spec:
             - name: EBFW_INSPECT_BODY
               valueFrom:
                 configMapKeyRef: { name: ebfw-config, key: inspect-body }
+            - name: EBFW_OUTPUT
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: output }
+            - name: EBFW_METRICS_ADDR
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: metrics-addr }
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
           volumeMounts:
             - name: config
               mountPath: /etc/ebfw

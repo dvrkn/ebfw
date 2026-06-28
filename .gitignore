@@ -6,3 +6,4 @@
 *.o
 # third-party reference skill (cloned separately, has its own repo)
 /ebpf-skill/
+CLAUDE.md
