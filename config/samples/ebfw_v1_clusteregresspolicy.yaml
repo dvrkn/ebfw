@@ -3,6 +3,12 @@ kind: ClusterEgressPolicy
 metadata:
   name: block-known-bad
 spec:
+  # podSelector is required. An EMPTY selector ({}) scopes the policy to every pod
+  # on the node (cluster-wide). To target a subset across all namespaces instead:
+  #   podSelector:
+  #     matchExpressions:
+  #       - { key: tier, operator: In, values: ["payments", "secrets"] }
+  podSelector: {}
   # Node-wide blocklist: allow by default, deny only the rules below. This is
   # the safe cluster-scoped pattern (it never cuts off the node).
   defaultAction: Allow
@@ -15,9 +21,10 @@ spec:
       action: Deny
       match:
         ports: [25, 465, 587]
-# DANGER: a node-wide allowlist (defaultAction: Deny) cuts off ALL egress on
-# every node unless explicitly allowed. If you use it, allow DNS, the API
-# server, and image registries first:
+# DANGER: a node-wide allowlist (podSelector: {} + defaultAction: Deny) cuts off
+# ALL egress on every node unless explicitly allowed. If you use it, allow DNS,
+# the API server, and image registries first:
+#   podSelector: {}
 #   defaultAction: Deny
 #   rules:
 #     - name: allow-dns

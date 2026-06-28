@@ -11,9 +11,22 @@ import (
 // CRD. Both EgressPolicy (namespaced) and ClusterEgressPolicy (cluster-scoped)
 // embed this spec.
 type EgressPolicySpec struct {
+	// PodSelector selects the source pods this policy governs by label — its rules
+	// AND its defaultAction apply only to matching pods, so a defaultAction: Deny
+	// with a non-empty selector default-denies only the selected pods and never the
+	// rest of the namespace/node. It is required (mirroring
+	// NetworkPolicy.spec.podSelector): an EMPTY selector ({}) is explicit for
+	// "every pod in scope" — the whole namespace for EgressPolicy, the whole node
+	// for ClusterEgressPolicy (which is also how a ClusterEgressPolicy opts into a
+	// node-global default-deny).
+	// +kubebuilder:validation:Required
+	PodSelector metav1.LabelSelector `json:"podSelector"`
+
 	// DefaultAction is applied to a flow that matches no rule. Empty defaults to
-	// Allow (blocklist). On a namespaced EgressPolicy, Deny default-denies only
-	// that namespace's pods; on a ClusterEgressPolicy it default-denies the node.
+	// Allow (blocklist). It applies only to the pods selected by podSelector: on a
+	// namespaced EgressPolicy, Deny default-denies that namespace's selected pods;
+	// on a ClusterEgressPolicy it default-denies the selected pods node-wide, and
+	// only an EMPTY podSelector ({}) makes it the true node-global default-deny.
 	// +kubebuilder:validation:Enum=Allow;Deny
 	// +optional
 	DefaultAction string `json:"defaultAction,omitempty"`
@@ -155,7 +168,10 @@ func (s *EgressPolicySpec) ToPolicy() *policy.Policy {
 	if s == nil {
 		return &policy.Policy{}
 	}
-	p := &policy.Policy{DefaultAction: policy.DefaultPosture(s.DefaultAction)}
+	p := &policy.Policy{
+		PodSelector:   labelSelectorToPolicy(&s.PodSelector),
+		DefaultAction: policy.DefaultPosture(s.DefaultAction),
+	}
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		pr := policy.Rule{
@@ -187,6 +203,23 @@ func (s *EgressPolicySpec) ToPolicy() *policy.Policy {
 		p.Rules = append(p.Rules, pr)
 	}
 	return p
+}
+
+// labelSelectorToPolicy converts a metav1.LabelSelector (the idiomatic CRD shape)
+// into the pure model's k8s-free LabelSelector. A nil/empty selector yields nil.
+func labelSelectorToPolicy(sel *metav1.LabelSelector) *policy.LabelSelector {
+	if sel == nil || (len(sel.MatchLabels) == 0 && len(sel.MatchExpressions) == 0) {
+		return nil
+	}
+	out := &policy.LabelSelector{MatchLabels: sel.MatchLabels}
+	for _, req := range sel.MatchExpressions {
+		out.MatchExpressions = append(out.MatchExpressions, policy.LabelSelectorRequirement{
+			Key:      req.Key,
+			Operator: string(req.Operator),
+			Values:   req.Values,
+		})
+	}
+	return out
 }
 
 // portsToUint16 narrows CRD-friendly int32 ports to the engine's uint16,

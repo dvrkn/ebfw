@@ -4,8 +4,9 @@ import "sync"
 
 // PodInfo is the resolved identity of the pod that produced a flow. Fields are
 // best-effort: UID/Container/QoS come from the cgroup path (node-local, always
-// available for pod traffic); Namespace/Name/Node require the Kubernetes API and
-// are empty off-cluster or before the informer has synced.
+// available for pod traffic); Namespace/Name/Node/Labels require the Kubernetes
+// API and are empty off-cluster or before the informer has synced. Labels back
+// label-selector policy matching (Policy.PodSelector and per-rule pod labels).
 type PodInfo struct {
 	Namespace string
 	Name      string
@@ -13,6 +14,7 @@ type PodInfo struct {
 	Container string
 	QoS       string
 	Node      string
+	Labels    map[string]string
 }
 
 // Known reports whether the flow was attributed to a pod at all.
@@ -31,10 +33,11 @@ func (p PodInfo) String() string {
 	}
 }
 
-// Enricher turns a pod UID into namespace/name/node. Implementations must be
-// safe for concurrent use and cheap (called per event).
+// Enricher turns a pod UID into namespace/name/node + labels. Implementations
+// must be safe for concurrent use and cheap (called per event). The returned
+// labels map must be treated read-only by callers.
 type Enricher interface {
-	Enrich(uid string) (namespace, name, node string, ok bool)
+	Enrich(uid string) (namespace, name, node string, labels map[string]string, ok bool)
 	Close()
 }
 
@@ -42,8 +45,10 @@ type Enricher interface {
 // PodInfo with only the node-local identity.
 type nopEnricher struct{}
 
-func (nopEnricher) Enrich(string) (string, string, string, bool) { return "", "", "", false }
-func (nopEnricher) Close()                                       {}
+func (nopEnricher) Enrich(string) (string, string, string, map[string]string, bool) {
+	return "", "", "", nil, false
+}
+func (nopEnricher) Close() {}
 
 type cacheEntry struct {
 	id PodID
@@ -141,8 +146,8 @@ func (r *Resolver) lookupPath(id uint64) (string, bool) {
 
 func (r *Resolver) enrich(id PodID) PodInfo {
 	info := PodInfo{UID: id.UID, Container: id.ContainerID, QoS: id.QoS}
-	if ns, name, node, ok := r.enricher.Enrich(id.UID); ok {
-		info.Namespace, info.Name, info.Node = ns, name, node
+	if ns, name, node, labels, ok := r.enricher.Enrich(id.UID); ok {
+		info.Namespace, info.Name, info.Node, info.Labels = ns, name, node, labels
 	}
 	return info
 }

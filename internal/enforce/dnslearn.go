@@ -136,7 +136,7 @@ func (l *DNSLearner) handle(raw []byte) {
 	}
 
 	pod := l.resolver.ByCgroupID(cgroupID)
-	action, ports, ok := l.engine().DomainRuleVerdict(pod, nil, qname)
+	action, ports, ok := l.engine().DomainRuleVerdict(pod, pod.Labels, qname)
 	if !ok {
 		return // no domain rule matches this pod+name
 	}

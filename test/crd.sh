@@ -107,6 +107,7 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: EgressPolicy
 metadata: { name: valid-pol, namespace: default }
 spec:
+  podSelector: {}
   defaultAction: Allow
   rules:
     - name: allow-dns
@@ -118,6 +119,7 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: EgressPolicy
 metadata: { name: invalid-pol, namespace: default }
 spec:
+  podSelector: {}
   rules:
     - name: bad-cidr
       action: Deny
@@ -136,6 +138,7 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: EgressPolicy
 metadata: { name: block-probe, namespace: default }
 spec:
+  podSelector: {}            # govern the whole namespace; the rule narrows by pod name
   defaultAction: Allow
   rules:
     - name: block-cidr
@@ -158,6 +161,7 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: EgressPolicy
 metadata: { name: walled-deny, namespace: walled }
 spec:
+  podSelector: {}            # default-deny the entire walled namespace
   defaultAction: Deny
   rules:
     - name: allow-dns
@@ -186,6 +190,7 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: ClusterEgressPolicy
 metadata: { name: node-block }
 spec:
+  podSelector: {}            # node-wide
   defaultAction: Allow
   rules:
     - name: block-open-cidr
@@ -197,6 +202,36 @@ c_denied=0; kubectl exec probe -- curl -4 -s -o /dev/null --max-time 6 "https://
 [ "$c_denied" -ne 0 ] && echo "PASS  ClusterEgressPolicy blocks ${OPEN_IP} node-wide (rc=$c_denied)" || { echo "FAIL  ClusterEgressPolicy deny not enforced"; fail=1; }
 co_ok=""; for _ in $(seq 1 20); do [ "$(accepted clusteregresspolicy node-block)" = "True" ] && { co_ok=1; break; }; sleep 1; done
 [ -n "$co_ok" ] && echo "PASS  operator Accepted the ClusterEgressPolicy" || { echo "FAIL  ClusterEgressPolicy not Accepted"; fail=1; }
+
+# ── Test 6: podSelector scopes a policy to a labeled subset of pods ───────────
+# Two pods in one namespace; an EgressPolicy with podSelector + defaultAction:Deny
+# governs ONLY the labeled pod, leaving its neighbour fully open. 1.1.1.1 is
+# reachable here (the Test-3 block is scoped to default/probe; the Test-5 cluster
+# block is 1.0.0.0/24), so it is a clean "is egress allowed?" probe.
+note "Test 6: EgressPolicy(tenants) podSelector app=locked default-denies only the selected pod"
+kubectl create namespace tenants >/dev/null 2>&1 || true
+kubectl -n tenants run sel   --image=nicolaka/netshoot --labels=app=locked --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n tenants run unsel --image=nicolaka/netshoot --labels=app=open   --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n tenants wait --for=condition=Ready pod/sel   --timeout=120s >/dev/null || { echo "ERROR: sel not ready"; fail=1; }
+kubectl -n tenants wait --for=condition=Ready pod/unsel --timeout=120s >/dev/null || { echo "ERROR: unsel not ready"; fail=1; }
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: tenant-lock, namespace: tenants }
+spec:
+  podSelector:
+    matchLabels: { app: locked }
+  defaultAction: Deny
+  rules:
+    - name: allow-dns
+      action: Allow
+      match: { ports: [53] }
+YAML
+sleep 12  # re-walk maps the labeled pod's cgroup + programs its per-pod default-deny
+sel_denied=0; kubectl -n tenants exec sel   -- curl -4 -s -o /dev/null --max-time 6 "https://${BLOCKED_IP}/" || sel_denied=$?
+uns_open=1;   kubectl -n tenants exec unsel -- curl -4 -s -o /dev/null --max-time 8 "https://${BLOCKED_IP}/" && uns_open=0
+[ "$sel_denied" -ne 0 ] && echo "PASS  tenants/sel (app=locked) default-denied (rc=$sel_denied)"          || { echo "FAIL  podSelector did not govern the labeled pod"; fail=1; }
+[ "$uns_open" -eq 0 ]   && echo "PASS  tenants/unsel (app=open) unaffected by the podSelector policy"      || { echo "FAIL  podSelector leaked to an unselected pod"; fail=1; }
 
 echo "# ============================="
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi

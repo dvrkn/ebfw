@@ -61,12 +61,68 @@ spec:
               defaultAction:
                 description: |-
                   DefaultAction is applied to a flow that matches no rule. Empty defaults to
-                  Allow (blocklist). On a namespaced EgressPolicy, Deny default-denies only
-                  that namespace's pods; on a ClusterEgressPolicy it default-denies the node.
+                  Allow (blocklist). It applies only to the pods selected by podSelector: on a
+                  namespaced EgressPolicy, Deny default-denies that namespace's selected pods;
+                  on a ClusterEgressPolicy it default-denies the selected pods node-wide, and
+                  only an EMPTY podSelector ({}) makes it the true node-global default-deny.
                 enum:
                 - Allow
                 - Deny
                 type: string
+              podSelector:
+                description: |-
+                  PodSelector selects the source pods this policy governs by label — its rules
+                  AND its defaultAction apply only to matching pods, so a defaultAction: Deny
+                  with a non-empty selector default-denies only the selected pods and never the
+                  rest of the namespace/node. It is required (mirroring
+                  NetworkPolicy.spec.podSelector): an EMPTY selector ({}) is explicit for
+                  "every pod in scope" — the whole namespace for EgressPolicy, the whole node
+                  for ClusterEgressPolicy (which is also how a ClusterEgressPolicy opts into a
+                  node-global default-deny).
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
               rules:
                 description: Rules are evaluated in order; first match wins.
                 items:
@@ -166,6 +222,8 @@ spec:
                   - action
                   type: object
                 type: array
+            required:
+            - podSelector
             type: object
           status:
             description: EgressPolicyStatus is the observed state, shared by both

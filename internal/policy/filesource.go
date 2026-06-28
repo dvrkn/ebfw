@@ -61,7 +61,9 @@ func loadPolicyFile(path string) (*Policy, error) {
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid policy %s: %w", path, err)
 	}
-	return &p, nil
+	// Fold a top-level podSelector into the rules so the Engine/Programmer honor
+	// it; a no-op when no podSelector is set (preserves the global default path).
+	return Flatten(&p), nil
 }
 
 func (fs *fileSource) Snapshot() *Policy {

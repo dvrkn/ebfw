@@ -47,6 +47,13 @@ const (
 // future EgressPolicy CRD spec: wrap it in metav1.TypeMeta+ObjectMeta, add a
 // status, and this struct becomes spec.
 type Policy struct {
+	// PodSelector limits the whole policy — every rule AND the DefaultAction — to
+	// source pods matching this label selector. Empty/nil governs all pods in the
+	// policy's scope (the namespace for a namespaced EgressPolicy, the node for a
+	// ClusterEgressPolicy). It is "compiled away" by Aggregate/Flatten, which fold
+	// it into each rule's pod match and the default-deny catch-all, so the Engine
+	// and Programmer never read it directly.
+	PodSelector *LabelSelector `json:"podSelector,omitempty" yaml:"podSelector,omitempty"`
 	// DefaultAction is applied when no rule matches. Empty defaults to Allow
 	// (blocklist) so an empty/observe policy never breaks egress.
 	DefaultAction DefaultPosture `json:"defaultAction,omitempty" yaml:"defaultAction,omitempty"`
@@ -83,18 +90,22 @@ type Match struct {
 }
 
 // PodSelector picks source pods. Namespace/Name/UID are matched exactly against
-// the resolved pod identity; Labels are matched against the pod's labels (which
-// require the Kubernetes informer — populated by the enforcement Programmer).
+// the resolved pod identity; Labels (matchLabels) and MatchExpressions are
+// matched against the pod's labels (which require the Kubernetes informer —
+// surfaced into attr.PodInfo.Labels). MatchExpressions is normally populated
+// only by folding a policy-level subject selector (Policy.PodSelector) in.
 type PodSelector struct {
-	Namespace string            `json:"namespace,omitempty" yaml:"namespace,omitempty"`
-	Name      string            `json:"name,omitempty" yaml:"name,omitempty"`
-	UID       string            `json:"uid,omitempty" yaml:"uid,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Namespace        string                     `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	Name             string                     `json:"name,omitempty" yaml:"name,omitempty"`
+	UID              string                     `json:"uid,omitempty" yaml:"uid,omitempty"`
+	Labels           map[string]string          `json:"labels,omitempty" yaml:"labels,omitempty"`
+	MatchExpressions []LabelSelectorRequirement `json:"matchExpressions,omitempty" yaml:"matchExpressions,omitempty"`
 }
 
 // IsZero reports whether the selector constrains nothing (matches every pod).
 func (s PodSelector) IsZero() bool {
-	return s.Namespace == "" && s.Name == "" && s.UID == "" && len(s.Labels) == 0
+	return s.Namespace == "" && s.Name == "" && s.UID == "" &&
+		len(s.Labels) == 0 && len(s.MatchExpressions) == 0
 }
 
 // Mutation describes an L7 edit. These are carried as data only for now; the
@@ -127,6 +138,9 @@ func (p *Policy) Validate() error {
 	default:
 		return fmt.Errorf("invalid defaultAction %q (want Allow or Deny)", p.DefaultAction)
 	}
+	if err := p.PodSelector.validate(); err != nil {
+		return fmt.Errorf("podSelector: %w", err)
+	}
 	for i := range p.Rules {
 		if err := p.Rules[i].validate(); err != nil {
 			return fmt.Errorf("rule %d (%q): %w", i, p.Rules[i].Name, err)
@@ -158,6 +172,11 @@ func (r *Rule) validate() error {
 	for _, c := range r.Match.CIDRs {
 		if _, _, err := net.ParseCIDR(c); err != nil {
 			return fmt.Errorf("invalid CIDR %q: %w", c, err)
+		}
+	}
+	for i := range r.Match.Pod.MatchExpressions {
+		if err := r.Match.Pod.MatchExpressions[i].validate(); err != nil {
+			return fmt.Errorf("pod.matchExpressions[%d]: %w", i, err)
 		}
 	}
 	return nil
