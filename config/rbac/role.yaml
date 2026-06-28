@@ -1,0 +1,24 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ebfw-operator
+rules:
+- apiGroups:
+  - ebfw.dvrkn.com
+  resources:
+  - clusteregresspolicies
+  - egresspolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ebfw.dvrkn.com
+  resources:
+  - clusteregresspolicies/status
+  - egresspolicies/status
+  verbs:
+  - get
+  - patch
+  - update
