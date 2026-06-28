@@ -57,6 +57,26 @@ data:
   # Output + metrics.
   output: "text"            # event format: text | json
   metrics-addr: ":9090"     # Prometheus /metrics listen address ("" disables)
+  # Egress enforcement. off = observe-only (default);
+  # log = evaluate policy and annotate events with the verdict (no drops);
+  # enforce = drop denied egress at the kernel datapath.
+  enforce-mode: "off"
+  policy.yaml: |
+    # Egress policy — applied only when enforce-mode is "log" or "enforce".
+    #   defaultAction: Allow  -> blocklist (deny only what rules match)
+    #   defaultAction: Deny   -> allowlist (allow only what rules match)
+    defaultAction: Allow
+    rules: []
+    # Example allowlist (set defaultAction: Deny and replace rules: [] with):
+    #   - name: allow-github
+    #     action: Allow
+    #     match:
+    #       domains: ["github.com", "*.githubusercontent.com"]
+    #       ports: [443]
+    #   - name: block-smtp
+    #     action: Deny
+    #     match:
+    #       ports: [25, 587]
   config.yaml: |
     cgroup: /sys/fs/cgroup
     exclude:
@@ -126,6 +146,11 @@ spec:
             - name: EBFW_METRICS_ADDR
               valueFrom:
                 configMapKeyRef: { name: ebfw-config, key: metrics-addr }
+            - name: EBFW_ENFORCE_MODE
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: enforce-mode }
+            - name: EBFW_POLICY
+              value: /etc/ebfw/policy.yaml
           ports:
             - name: metrics
               containerPort: 9090
