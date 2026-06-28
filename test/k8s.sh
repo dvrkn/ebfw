@@ -4,8 +4,9 @@
 # and assert it attributes real pod egress (DNS / TLS / HTTP / HTTPS) to the
 # originating pod and serves Prometheus metrics. Event fields are checked with jq.
 #
-# This covers the whole Stage-1 path the bare-host e2e (test/e2e.sh) cannot:
-# cgroup-id -> pod resolution and Kubernetes API enrichment (namespace/name).
+# This covers the pod-attribution path the bare-host e2e (test/e2e.sh) cannot:
+# cgroup-id -> pod resolution and Kubernetes API enrichment (namespace/name),
+# plus per-pod enforcement attributed back to the pod.
 #
 # Builds the image itself via the repo Dockerfile (no local Go/clang needed).
 # Requires: Linux, docker, k3d, kubectl, curl, jq.
@@ -123,6 +124,55 @@ if grep -q 'ebfw_events_total' "$metrics" && grep -Eq 'ebfw_attribution_total.*h
 else
   echo "FAIL  metrics endpoint"; fail=1
 fi
+
+# ── enforcement: deny a CIDR for ONLY the probe pod, attributed ──────────────
+# This exercises the path the host e2e cannot: a pod-selector rule resolved via
+# the informer + cgroup walk, programmed per-pod, and the deny attributed back to
+# the pod in JSON. A pod-scoped CIDR is deterministic (no DNS race).
+note "enabling enforcement (deny 1.1.1.0/24 for pod default/probe)"
+epatch="$(mktemp)"
+cat > "$epatch" <<YAML
+data:
+  enforce-mode: "enforce"
+  policy.yaml: |
+    defaultAction: Allow
+    rules:
+      - name: e2e-block-probe-cidr
+        action: Deny
+        match:
+          pod: { namespace: default, name: probe }
+          cidrs: ["1.1.1.0/24"]
+YAML
+kubectl -n "$NS" patch configmap ebfw-config --type merge --patch-file "$epatch" >/dev/null
+rm -f "$epatch"
+kubectl -n "$NS" rollout restart ds/ebfw >/dev/null
+kubectl -n "$NS" rollout status ds/ebfw --timeout=120s >/dev/null || { echo "FAIL  enforce: ds not ready"; fail=1; }
+for _ in $(seq 1 30); do
+  kubectl -n "$NS" logs ds/ebfw 2>/dev/null | grep -q "pod informer synced" && break
+  sleep 1
+done
+sleep 12  # let the programmer's re-walk ticker map the probe pod's cgroup
+
+note "probing denied CIDR (expect failure) + allowed domain (expect ok) from probe"
+denied_rc=0
+kubectl exec probe -- curl -4 -s -o /dev/null --max-time 6 https://1.1.1.1/ || denied_rc=$?
+allowed_rc=1
+kubectl exec probe -- curl -4 -s -o /dev/null --max-time 10 "https://${SHOWN}/" && allowed_rc=0
+
+eevents="$(mktemp)"
+kubectl -n "$NS" logs ds/ebfw --tail=400 2>&1 | grep '^{' > "$eevents" || true
+echo "# ---- enforcement events (probe) ----"
+jq -rc 'select(.pod.name=="probe" and (.action // "")!="") | [.kind, (.dst // .domain), .action, (.rule // "")] | @tsv' "$eevents" | sort -u | tail -8
+echo "# ------------------------------------"
+
+if [ "$denied_rc" -ne 0 ]; then echo "PASS  enforce: probe denied to 1.1.1.1 (rc=$denied_rc)"; else echo "FAIL  enforce: probe reached 1.1.1.1"; fail=1; fi
+if [ "$allowed_rc" -eq 0 ]; then echo "PASS  enforce: probe still reaches ${SHOWN}"; else echo "FAIL  enforce: probe blocked from ${SHOWN}"; fail=1; fi
+if [ -n "$(jq -c 'select(.kind=="connect" and (.action|ascii_downcase)=="deny" and .pod.name=="probe" and (.dst|startswith("1.1.1")))' "$eevents" 2>/dev/null | head -1)" ]; then
+  echo "PASS  enforce: deny attributed to pod default/probe"
+else
+  echo "FAIL  enforce: no attributed deny event for probe"; fail=1
+fi
+rm -f "$eevents"
 
 echo "# ============================="
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi

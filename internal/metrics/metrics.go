@@ -38,6 +38,33 @@ var (
 		Name: "ebfw_uprobe_attached",
 		Help: "Number of libssl SSL_write uprobes currently attached.",
 	})
+
+	// EnforcementDecisionsTotal counts policy verdicts applied to connection-level
+	// events, by action (allow/deny/modify) and mode (log/enforce).
+	EnforcementDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ebfw_enforcement_decisions_total",
+		Help: "Egress enforcement decisions, by action and mode.",
+	}, []string{"action", "mode"})
+
+	// PolicyRules is the number of rules in the currently loaded egress policy.
+	PolicyRules = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ebfw_policy_rules",
+		Help: "Number of rules in the currently loaded egress policy.",
+	})
+
+	// EnforcementDropsTotal counts denials observed at the cgroup datapath, by
+	// kind. Under dry-run these are would-be drops (nothing is actually dropped).
+	EnforcementDropsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ebfw_enforcement_drops_total",
+		Help: "Egress denials at the cgroup datapath, by kind (connect/tls/http).",
+	}, []string{"kind"})
+
+	// DNSLearnedIPs is the number of domain→IP verdict entries currently
+	// programmed by DNS learning.
+	DNSLearnedIPs = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ebfw_dns_learned_ips",
+		Help: "Domain→IP verdict entries currently programmed by DNS learning.",
+	})
 )
 
 // Serve starts an HTTP server exposing /metrics at addr, blocking until the

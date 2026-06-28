@@ -29,6 +29,36 @@ type Config struct {
 	// NodeName scopes the pod-attribution informer to this node (EBFW_NODE_NAME,
 	// set via the downward API). Empty falls back to watching all pods.
 	NodeName string `yaml:"-"`
+	// Enforce controls egress policy enforcement. Sourced from env (a ConfigMap);
+	// the policy itself lives in its own YAML file (1:1 with the future CRD).
+	Enforce Enforcement `yaml:"-"`
+}
+
+// Enforcement holds the egress-enforcement operational toggles.
+type Enforcement struct {
+	// Mode is "off" (observe-only, default), "log" (evaluate the policy and
+	// annotate events, no drops), or "enforce" (drop denied egress at the
+	// kernel datapath). EBFW_ENFORCE_MODE.
+	Mode string
+	// PolicyPath is the path to the policy YAML file. EBFW_POLICY.
+	PolicyPath string
+	// PinPath is the bpffs directory for pinned enforcement maps, so an external
+	// controller could update policy without a program reload. EBFW_BPF_PIN_PATH.
+	PinPath string
+	// DryRun, in enforce mode, programs the datapath and computes verdicts but
+	// never drops — a high-fidelity canary. EBFW_ENFORCE_DRY_RUN.
+	DryRun bool
+}
+
+// EnforcementFromEnv reads the enforcement toggles from the environment.
+// Enforcement defaults off so the agent stays observe-only until enabled.
+func EnforcementFromEnv() Enforcement {
+	return Enforcement{
+		Mode:       strings.ToLower(envStr("EBFW_ENFORCE_MODE", "off")),
+		PolicyPath: strings.TrimSpace(os.Getenv("EBFW_POLICY")),
+		PinPath:    envStr("EBFW_BPF_PIN_PATH", "/sys/fs/bpf/ebfw"),
+		DryRun:     envBool("EBFW_ENFORCE_DRY_RUN", false),
+	}
 }
 
 // FromEnv populates the env-sourced runtime fields (inspection depth, output
@@ -38,6 +68,7 @@ func (c *Config) FromEnv() {
 	c.Output = envStr("EBFW_OUTPUT", "text")
 	c.MetricsAddr = envStr("EBFW_METRICS_ADDR", ":9090")
 	c.NodeName = strings.TrimSpace(os.Getenv("EBFW_NODE_NAME"))
+	c.Enforce = EnforcementFromEnv()
 }
 
 func envStr(key, def string) string {
