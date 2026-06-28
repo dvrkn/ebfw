@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded in-flight runs for the same PR/branch, but never cancel a
+# push/tag run — those can reach the release job, and cancelling mid-publish
+# could leave a partial multi-arch image manifest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   e2e:
     # ubuntu-24.04 runners are real VMs with cgroup v2, a modern kernel, sudo,
