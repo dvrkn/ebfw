@@ -4,9 +4,16 @@ metadata:
   name: allow-github
   namespace: default
 spec:
-  # Allowlist for pods in this namespace: deny by default, allow only the rules
-  # below. defaultAction: Deny here default-denies ONLY this namespace's pods —
-  # never the whole node (that requires a ClusterEgressPolicy).
+  # podSelector is required; it scopes this whole policy to a subset of the
+  # namespace's pods. Use {} to govern EVERY pod in the namespace. Here only pods
+  # labeled app=frontend are governed: the rules below AND the defaultAction: Deny
+  # apply only to them — other pods in `default` are untouched.
+  podSelector:
+    matchLabels:
+      app: frontend
+  # Allowlist for the selected pods: deny by default, allow only the rules below.
+  # defaultAction: Deny here default-denies ONLY the selected pods in this
+  # namespace — never the whole node (that requires a ClusterEgressPolicy).
   defaultAction: Deny
   rules:
     - name: allow-dns

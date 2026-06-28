@@ -3,6 +3,8 @@ package v1
 import (
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/dvrkn/ebfw/internal/policy"
 )
 
@@ -82,5 +84,42 @@ func TestNilSpecToPolicy(t *testing.T) {
 	var s *EgressPolicySpec
 	if p := s.ToPolicy(); p == nil || len(p.Rules) != 0 {
 		t.Fatalf("nil spec should yield empty policy, got %+v", p)
+	}
+}
+
+func TestToPolicyConvertsPodSelector(t *testing.T) {
+	spec := &EgressPolicySpec{
+		PodSelector: metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "web"},
+			MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "tier", Operator: metav1.LabelSelectorOpIn, Values: []string{"frontend"}},
+			},
+		},
+		DefaultAction: "Deny",
+		Rules:         []Rule{{Name: "allow-dns", Action: "Allow", Match: Match{Ports: []int32{53}}}},
+	}
+	p := spec.ToPolicy()
+	if p.PodSelector == nil {
+		t.Fatal("podSelector not converted")
+	}
+	if p.PodSelector.MatchLabels["app"] != "web" {
+		t.Fatalf("matchLabels = %v", p.PodSelector.MatchLabels)
+	}
+	if len(p.PodSelector.MatchExpressions) != 1 ||
+		p.PodSelector.MatchExpressions[0].Key != "tier" ||
+		p.PodSelector.MatchExpressions[0].Operator != policy.OpIn {
+		t.Fatalf("matchExpressions = %+v", p.PodSelector.MatchExpressions)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("converted policy should validate: %v", err)
+	}
+}
+
+func TestToPolicyEmptyPodSelectorIsNil(t *testing.T) {
+	// An empty (required) selector {} means "all pods in scope" -> nil internal
+	// selector, so Aggregate folds nothing.
+	spec := &EgressPolicySpec{PodSelector: metav1.LabelSelector{}, Rules: nil}
+	if p := spec.ToPolicy(); p.PodSelector != nil {
+		t.Fatalf("empty podSelector should convert to nil, got %+v", p.PodSelector)
 	}
 }

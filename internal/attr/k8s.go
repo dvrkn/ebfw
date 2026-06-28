@@ -78,16 +78,17 @@ func NewK8sEnricher(nodeName string) (Enricher, error) {
 	return e, nil
 }
 
-func (e *k8sEnricher) Enrich(uid string) (namespace, name, node string, ok bool) {
+func (e *k8sEnricher) Enrich(uid string) (namespace, name, node string, labels map[string]string, ok bool) {
 	objs, err := e.indexer.ByIndex(uidIndex, uid)
 	if err != nil || len(objs) == 0 {
-		return "", "", "", false
+		return "", "", "", nil, false
 	}
 	p, ok := objs[0].(*corev1.Pod)
 	if !ok {
-		return "", "", "", false
+		return "", "", "", nil, false
 	}
-	return p.Namespace, p.Name, p.Spec.NodeName, true
+	// p.Labels is owned by the shared informer cache; callers treat it read-only.
+	return p.Namespace, p.Name, p.Spec.NodeName, p.Labels, true
 }
 
 func (e *k8sEnricher) Close() { close(e.stop) }
