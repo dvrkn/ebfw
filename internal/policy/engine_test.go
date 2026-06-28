@@ -166,6 +166,36 @@ func TestEvaluatePodSelector(t *testing.T) {
 	}
 }
 
+func TestEvaluatePodMatchExpressions(t *testing.T) {
+	// A rule whose pod selector carries a folded subject's matchExpressions:
+	// deny example.com only for pods whose tier is in {frontend}.
+	pol := &Policy{DefaultAction: PostureAllow, Rules: []Rule{
+		{Name: "deny-fe", Action: ActionDeny, Match: Match{
+			Pod:     PodSelector{MatchExpressions: []LabelSelectorRequirement{{Key: "tier", Operator: OpIn, Values: []string{"frontend"}}}},
+			Domains: []string{"example.com"},
+		}},
+	}}
+	eng := mustEngine(t, pol)
+	base := Flow{Domain: "example.com", Port: 443}
+
+	f := base
+	f.Labels = map[string]string{"tier": "frontend"}
+	if v := eng.Evaluate(f); v.Action != ActionDeny {
+		t.Errorf("tier=frontend: got %s, want Deny", v.Action)
+	}
+
+	f = base
+	f.Labels = map[string]string{"tier": "backend"}
+	if v := eng.Evaluate(f); v.Action != ActionAllow {
+		t.Errorf("tier=backend: got %s, want Allow", v.Action)
+	}
+
+	f = base // no labels at all
+	if v := eng.Evaluate(f); v.Action != ActionAllow {
+		t.Errorf("no labels: got %s, want Allow", v.Action)
+	}
+}
+
 func TestEvaluateModifyCarriesMutations(t *testing.T) {
 	pol := &Policy{Rules: []Rule{
 		{Name: "inject", Action: ActionModify, Match: Match{Domains: []string{"example.com"}}, Mutations: []Mutation{

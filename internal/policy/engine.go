@@ -189,8 +189,21 @@ func (s PodSelector) matches(f Flow) bool {
 	if s.UID != "" && s.UID != f.Pod.UID {
 		return false
 	}
+	return s.MatchesLabels(f.Labels)
+}
+
+// MatchesLabels reports whether the given pod labels satisfy the selector's
+// label requirements (matchLabels equality + matchExpressions). The identity
+// dimensions (namespace/name/uid) are checked separately. The enforcement
+// Programmer reuses this to resolve a selector to cgroup ids by pod labels.
+func (s PodSelector) MatchesLabels(labels map[string]string) bool {
 	for k, v := range s.Labels {
-		if f.Labels[k] != v {
+		if labels[k] != v {
+			return false
+		}
+	}
+	for i := range s.MatchExpressions {
+		if !s.MatchExpressions[i].matches(labels) {
 			return false
 		}
 	}

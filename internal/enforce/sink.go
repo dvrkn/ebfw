@@ -92,8 +92,8 @@ func (s *sink) Emit(e output.Event) {
 }
 
 // flowFromEvent projects an observed event onto the policy Flow shape. Pod
-// labels are not yet populated (PodInfo carries none); label-selector rules
-// therefore match only once the Programmer wires the informer.
+// labels (when the informer has them) drive label-selector and policy-level
+// podSelector matching.
 func flowFromEvent(e output.Event) policy.Flow {
 	var dst net.IP
 	if e.Dst != "" {
@@ -101,6 +101,7 @@ func flowFromEvent(e output.Event) policy.Flow {
 	}
 	return policy.Flow{
 		Pod:    e.Pod,
+		Labels: e.Pod.Labels,
 		DstIP:  dst,
 		Port:   uint16(e.Port),
 		Domain: e.Domain,

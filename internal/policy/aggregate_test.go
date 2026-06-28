@@ -93,6 +93,118 @@ func TestAggregateDeterministicAndIsolated(t *testing.T) {
 	}
 }
 
+func TestAggregateFoldsSubjectIntoRules(t *testing.T) {
+	subject := &LabelSelector{MatchLabels: map[string]string{"app": "web"}}
+	ns := []NamespacedPolicy{{
+		Namespace: "team-a",
+		Name:      "p",
+		Policy: &Policy{
+			PodSelector: subject,
+			Rules:       []Rule{{Name: "allow-gh", Action: ActionAllow, Match: Match{Domains: []string{"github.com"}}}},
+		},
+	}}
+	out := Aggregate(nil, ns)
+
+	r := out.Rules[0]
+	if r.Match.Pod.Namespace != "team-a" {
+		t.Fatalf("rule not scoped to namespace: %+v", r.Match.Pod)
+	}
+	if r.Match.Pod.Labels["app"] != "web" {
+		t.Fatalf("subject labels not folded into rule: %+v", r.Match.Pod)
+	}
+	// The aggregate must NOT keep a top-level subject (it has been folded away).
+	if !out.PodSelector.Empty() {
+		t.Fatalf("aggregate kept a top-level podSelector: %+v", out.PodSelector)
+	}
+	// Source policy's subject map must be untouched (shared with the CRD object).
+	if len(subject.MatchLabels) != 1 {
+		t.Fatalf("folding mutated the source subject: %v", subject.MatchLabels)
+	}
+}
+
+func TestAggregateNamespacedSubjectDefaultDenyScopesToSelectedPods(t *testing.T) {
+	ns := []NamespacedPolicy{{
+		Namespace: "team-a",
+		Name:      "p",
+		Policy: &Policy{
+			PodSelector:   &LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			DefaultAction: PostureDeny,
+			Rules:         []Rule{{Name: "allow-dns", Action: ActionAllow, Match: Match{Ports: []uint16{53}}}},
+		},
+	}}
+	out := Aggregate(nil, ns)
+
+	// Global default stays Allow — a namespaced/subject Deny never cuts the node.
+	if out.EffectiveDefault() != PostureAllow {
+		t.Fatalf("global default = %q, want Allow", out.EffectiveDefault())
+	}
+	// The allow rule is scoped to the selected pods.
+	if out.Rules[0].Match.Pod.Labels["app"] != "web" || out.Rules[0].Match.Pod.Namespace != "team-a" {
+		t.Fatalf("allow rule not scoped to selected pods: %+v", out.Rules[0].Match.Pod)
+	}
+	// The trailing catch-all Deny is scoped to namespace AND subject labels, so
+	// it only denies team-a pods labeled app=web, not the rest of team-a.
+	last := out.Rules[len(out.Rules)-1]
+	if last.Action != ActionDeny || last.Match.Pod.Namespace != "team-a" || last.Match.Pod.Labels["app"] != "web" {
+		t.Fatalf("subject catch-all wrong: %+v", last)
+	}
+}
+
+func TestAggregateClusterSubjectDenyDoesNotGoGlobal(t *testing.T) {
+	cl := []ClusterPolicy{{
+		Name: "lockdown",
+		Policy: &Policy{
+			PodSelector:   &LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			DefaultAction: PostureDeny,
+			Rules:         []Rule{{Name: "allow-dns", Action: ActionAllow, Match: Match{Ports: []uint16{53}}}},
+		},
+	}}
+	out := Aggregate(cl, nil)
+
+	// A subject-scoped cluster Deny must NOT flip the node-global default.
+	if out.EffectiveDefault() != PostureAllow {
+		t.Fatalf("global default = %q, want Allow (subject-scoped cluster Deny)", out.EffectiveDefault())
+	}
+	// Instead it becomes a node-wide (no namespace) catch-all scoped to the labels.
+	last := out.Rules[len(out.Rules)-1]
+	if last.Action != ActionDeny || last.Match.Pod.Namespace != "" || last.Match.Pod.Labels["app"] != "web" {
+		t.Fatalf("cluster subject catch-all wrong: %+v", last)
+	}
+	if last.Name != "cluster-default-deny/lockdown" {
+		t.Fatalf("catch-all name = %q", last.Name)
+	}
+}
+
+func TestFlatten(t *testing.T) {
+	// No subject: returned unchanged (preserves the global default-deny path).
+	plain := &Policy{DefaultAction: PostureDeny, Rules: []Rule{{Name: "r", Action: ActionAllow}}}
+	if got := Flatten(plain); got != plain {
+		t.Fatalf("Flatten of a subject-less policy should be identity")
+	}
+	if Flatten(nil) != nil {
+		t.Fatalf("Flatten(nil) should be nil")
+	}
+
+	// With subject + default-deny: folds into rules + adds a scoped catch-all,
+	// and the global default stays Allow.
+	subj := &Policy{
+		PodSelector:   &LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+		DefaultAction: PostureDeny,
+		Rules:         []Rule{{Name: "allow-dns", Action: ActionAllow, Match: Match{Ports: []uint16{53}}}},
+	}
+	out := Flatten(subj)
+	if out.EffectiveDefault() != PostureAllow {
+		t.Fatalf("flattened default = %q, want Allow", out.EffectiveDefault())
+	}
+	if out.Rules[0].Match.Pod.Labels["app"] != "web" {
+		t.Fatalf("subject not folded into rule: %+v", out.Rules[0].Match.Pod)
+	}
+	last := out.Rules[len(out.Rules)-1]
+	if last.Action != ActionDeny || last.Match.Pod.Labels["app"] != "web" {
+		t.Fatalf("flattened catch-all wrong: %+v", last)
+	}
+}
+
 func TestScopeToNamespace(t *testing.T) {
 	p := &Policy{Rules: []Rule{
 		{Name: "r1", Action: ActionAllow, Match: Match{Pod: PodSelector{Namespace: "other", Name: "x"}}},
