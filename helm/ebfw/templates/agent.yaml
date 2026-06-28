@@ -1,0 +1,151 @@
+{{- if .Values.agent.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ebfw.agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ebfw.labels" . | nindent 4 }}
+---
+# Pod attribution + (when policySource=crd) reading the egress policy CRDs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ebfw.agent.fullname" . }}
+  labels:
+    {{- include "ebfw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ebfw.dvrkn.com"]
+    resources: ["egresspolicies", "clusteregresspolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ebfw.agent.fullname" . }}
+  labels:
+    {{- include "ebfw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ebfw.agent.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ebfw.agent.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ebfw.agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ebfw.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    cgroup: /sys/fs/cgroup
+    exclude:
+      cidrs:
+        {{- range .Values.agent.exclude.cidrs }}
+        - {{ . | quote }}
+        {{- end }}
+      domainSuffixes:
+        {{- range .Values.agent.exclude.domainSuffixes }}
+        - {{ . | quote }}
+        {{- end }}
+  policy.yaml: |
+    # Fallback policy used only when policySource=file (or CRD watch is
+    # unavailable). With policySource=crd this is ignored.
+    defaultAction: Allow
+    rules: []
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ebfw.agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ebfw.labels" . | nindent 4 }}
+    {{- include "ebfw.agent.selectorLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ebfw.agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ebfw.agent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ebfw.agent.fullname" . }}
+      hostNetwork: true
+      hostPID: true   # needed to find each container's libssl via /proc
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ebfw
+          image: {{ include "ebfw.agent.image" . | quote }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: EBFW_CONFIG
+              value: /etc/ebfw/config.yaml
+            - name: EBFW_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: EBFW_INSPECT_PATHS
+              value: {{ .Values.agent.inspect.paths | quote }}
+            - name: EBFW_INSPECT_HEADERS
+              value: {{ .Values.agent.inspect.headers | quote }}
+            - name: EBFW_INSPECT_BODY
+              value: {{ .Values.agent.inspect.body | quote }}
+            - name: EBFW_OUTPUT
+              value: {{ .Values.agent.output | quote }}
+            - name: EBFW_METRICS_ADDR
+              value: {{ .Values.agent.metricsAddr | quote }}
+            - name: EBFW_ENFORCE_MODE
+              value: {{ .Values.agent.enforceMode | quote }}
+            - name: EBFW_POLICY_SOURCE
+              value: {{ .Values.agent.policySource | quote }}
+            - name: EBFW_POLICY
+              value: /etc/ebfw/policy.yaml
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          {{- with .Values.agent.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ebfw
+              readOnly: true
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+              mountPropagation: HostToContainer
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ebfw.agent.fullname" . }}
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+{{- end }}

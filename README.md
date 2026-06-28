@@ -71,11 +71,20 @@ internal/output/           Event model + text/json sinks (single emit chokepoint
 internal/metrics/          Prometheus collectors + /metrics server
 internal/l7/               shared HTTP request parser (headers; body is a stub)
 internal/tlsparse/         TLS ClientHello -> SNI extractor (+ unit test)
+internal/policy/           pure policy model + engine + file source + CRD aggregation
+internal/crdsource/        PolicySource backed by the EgressPolicy CRDs (in-process informer)
+internal/controller/       thin status-only reconcilers for the two CRDs
+api/v1/                    EgressPolicy + ClusterEgressPolicy types (CRD spec + ToPolicy)
+cmd/operator/              the control-plane operator (manager) entrypoint
+config/                    kubebuilder kustomize tree (generated CRDs, RBAC, manager)
+helm/ebfw/                 Helm chart: CRDs + operator + agent DaemonSet
 bpf/egress.bpf.c           the cgroup_skb/egress program
 bpf/sslsnoop.bpf.c         the SSL_write uprobe program
-deploy/ebfw.yaml           Namespace + ServiceAccount + RBAC + ConfigMap + DaemonSet
-test/e2e.sh                end-to-end test (domain / ssl / paths / headers / filter / metrics / json)
-Dockerfile                 multi-stage: image (default) or `--target bin` host binary
+deploy/ebfw.yaml           Namespace + ServiceAccount + RBAC + ConfigMap + DaemonSet (agent-only quickstart)
+test/e2e.sh                host e2e (domain / ssl / paths / headers / filter / metrics / enforcement)
+test/k8s.sh                k3d e2e (pod attribution + CRD-driven enforcement)
+Dockerfile                 agent image: multi-stage (BPF + Go), or `--target bin` host binary
+Dockerfile.operator        operator image (pure Go, no eBPF)
 ```
 
 ## Configuration
@@ -111,7 +120,8 @@ Two layers:
   | `EBFW_METRICS_ADDR` | `:9090` | Prometheus `/metrics` listen address (empty disables) |
   | `EBFW_NODE_NAME` | _(unset)_ | this node's name (set via the downward API); scopes the pod informer |
   | `EBFW_ENFORCE_MODE` | `off` | egress enforcement: `off` / `log` / `enforce` (see below) |
-  | `EBFW_POLICY` | _(unset)_ | path to the egress policy YAML |
+  | `EBFW_POLICY_SOURCE` | `file` | where policy comes from: `file` (the `EBFW_POLICY` YAML) or `crd` (watch the `EgressPolicy` + `ClusterEgressPolicy` CRDs) |
+  | `EBFW_POLICY` | _(unset)_ | path to the egress policy YAML (used when `EBFW_POLICY_SOURCE=file`) |
   | `EBFW_ENFORCE_DRY_RUN` | `false` | in `enforce` mode, program the datapath but suppress drops (canary) |
 
 ### Enforcement (Stage 2)
@@ -158,6 +168,28 @@ treats `Modify` as `Allow`.
 
 For a full k3d walkthrough (deploy, enable a demo blocklist, watch allow/deny
 events attributed per pod), see [`deploy/DEMO.md`](deploy/DEMO.md).
+
+### Egress policy CRDs (Stage 3)
+
+Instead of a YAML file, the policy can be declared as Kubernetes resources. Set
+`EBFW_POLICY_SOURCE=crd` (the Helm chart's default) and each agent watches two
+CRDs in `ebfw.dvrkn.com/v1`, cluster-wide:
+
+- **`EgressPolicy`** (namespaced) — rules for the pods in **one namespace**. Its
+  `defaultAction: Deny` default-denies only that namespace's pods.
+- **`ClusterEgressPolicy`** (cluster-scoped) — **node-wide** rules and the only
+  place that can set a node-global default-deny.
+
+The agent aggregates every policy on the node (cluster rules first, then
+per-namespace rules, then per-namespace default-deny catch-alls) into the same
+engine + datapath used by the file source — so enforcement behaviour is
+identical, only the source differs. A thin control-plane **operator** validates
+each resource and records `status.conditions[Accepted]`; it does not program the
+datapath (the per-node agents do). An invalid resource is dropped (and marked
+`Accepted=False`) without affecting the others.
+
+Full field reference, aggregation semantics, and the node-wide default-deny
+caveat are in [`docs/egresspolicy.md`](docs/egresspolicy.md).
 
 ### Pod attribution
 
@@ -210,6 +242,21 @@ to find each container's libssl via `/proc`). To turn off path inspection, set
 `inspect-paths: "false"` in the ConfigMap. Fine-grained capabilities instead of
 `privileged` (kernel-dependent): `CAP_BPF, CAP_PERFMON, CAP_NET_ADMIN, CAP_SYS_ADMIN`.
 
+`deploy/ebfw.yaml` is the agent-only quickstart (no CRDs, file-based policy). To
+install the full Stage-3 stack — the CRDs, the operator, and the agent wired to
+watch them (`EBFW_POLICY_SOURCE=crd`) — use the Helm chart:
+
+```bash
+helm install ebfw ./helm/ebfw --namespace ebfw --create-namespace \
+  --set agent.enforceMode=log        # observe verdicts first; flip to enforce when ready
+
+kubectl apply -f config/samples/ebfw_v1_egresspolicy.yaml
+kubectl get egp,cegp -A
+```
+
+Published images: `ghcr.io/dvrkn/ebfw` (agent) and `ghcr.io/dvrkn/ebfw-operator`
+(operator), built multi-arch by CI on `main`/tags after the test jobs pass.
+
 ## End-to-end test
 
 `test/e2e.sh` runs the binary on a Linux host, generates real traffic with curl,
@@ -256,9 +303,17 @@ sudo ./test/e2e.sh out/ebfw
   pinned maps for the Stage-3 controller, and request **modify** (header
   injection / path rewrite — needs a terminating L7 proxy + TLS MITM; modeled in
   the policy now but not enforced)._
-- **Stage 3 — operator:** an `EgressPolicy` CRD (its spec is `policy.Policy`) +
-  controller that programs each node agent's pinned maps via a new
-  `PolicySource`.
+- **Stage 3 — operator (done):** `EgressPolicy` (namespaced) + `ClusterEgressPolicy`
+  (cluster-scoped) CRDs in `ebfw.dvrkn.com/v1`, whose spec mirrors `policy.Policy`.
+  Each agent watches both kinds cluster-wide via a new in-process informer
+  `PolicySource` (`EBFW_POLICY_SOURCE=crd`), aggregates them (cluster rules first,
+  then per-namespace rules + default-deny catch-alls; a namespaced Deny never cuts
+  off the node), and feeds the unchanged Stage-2 enforce stack. A thin
+  controller-runtime operator validates each resource and records its `Accepted`
+  status. Shipped as a Helm chart (CRDs + operator + agent) with multi-arch images
+  pushed to ghcr.io by CI. Scaffolded with kubebuilder; controllers covered by
+  envtest. _Deferred: pinned maps + an external map-programming controller (the
+  per-node agent programs its own maps for now)._
 - **Stage 4 — hardening:** TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, IPv6
   extension-header parsing + enforcement, cgroup-v1 fallback, request-body
   inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI, HA, scale

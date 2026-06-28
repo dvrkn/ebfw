@@ -1,0 +1,252 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: clusteregresspolicies.ebfw.dvrkn.com
+spec:
+  group: ebfw.dvrkn.com
+  names:
+    kind: ClusterEgressPolicy
+    listKind: ClusterEgressPolicyList
+    plural: clusteregresspolicies
+    shortNames:
+    - cegp
+    singular: clusteregresspolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.defaultAction
+      name: Default
+      type: string
+    - jsonPath: .status.ruleCount
+      name: Rules
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterEgressPolicy controls egress cluster/node-wide. It reuses
+          EgressPolicySpec but is cluster-scoped: its rules apply to pods in any
+          namespace, and a defaultAction of Deny sets the node-global default-deny
+          posture (the cluster-admin opt-in — be sure to allow the API server, image
+          registries, and DNS, or node egress breaks).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              EgressPolicySpec is the egress policy applied to pods. It mirrors the pure
+              internal/policy model so the same shape backs the file PolicySource and the
+              CRD. Both EgressPolicy (namespaced) and ClusterEgressPolicy (cluster-scoped)
+              embed this spec.
+            properties:
+              defaultAction:
+                description: |-
+                  DefaultAction is applied to a flow that matches no rule. Empty defaults to
+                  Allow (blocklist). On a namespaced EgressPolicy, Deny default-denies only
+                  that namespace's pods; on a ClusterEgressPolicy it default-denies the node.
+                enum:
+                - Allow
+                - Deny
+                type: string
+              rules:
+                description: Rules are evaluated in order; first match wins.
+                items:
+                  description: Rule binds a Match to an Action (and Mutations when
+                    Action is Modify).
+                  properties:
+                    action:
+                      description: |-
+                        Action is the verdict for matched flows. Modify permits the flow but
+                        applies Mutations (L7; modeled now, not enforced by the datapath yet).
+                      enum:
+                      - Allow
+                      - Deny
+                      - Modify
+                      type: string
+                    match:
+                      description: Match selects the flows this rule applies to. An
+                        empty Match matches every flow.
+                      properties:
+                        cidrs:
+                          description: CIDRs are destination IP ranges, e.g. "10.0.0.0/8".
+                          items:
+                            type: string
+                          type: array
+                        domains:
+                          description: |-
+                            Domains are DNS qname / TLS SNI / HTTP Host suffix globs: "example.com"
+                            and "*.example.com" both match example.com and any subdomain.
+                          items:
+                            type: string
+                          type: array
+                        methods:
+                          description: |-
+                            Methods (L7) only apply to http/https flows; evaluated for log/metrics and
+                            the future proxy, not by the L3/L4 drop datapath.
+                          items:
+                            type: string
+                          type: array
+                        pathPrefix:
+                          description: 'PathPrefix (L7): same scope as Methods.'
+                          type: string
+                        pod:
+                          description: |-
+                            Pod selects source pods. On a namespaced EgressPolicy the namespace is
+                            forced to the CR's own namespace.
+                          properties:
+                            labels:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            name:
+                              type: string
+                            namespace:
+                              type: string
+                            uid:
+                              type: string
+                          type: object
+                        ports:
+                          description: Ports are destination ports.
+                          items:
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          type: array
+                      type: object
+                    mutations:
+                      description: Mutations are required when Action is Modify and
+                        forbidden otherwise.
+                      items:
+                        description: |-
+                          Mutation describes an L7 edit, carried as data only for now (the deferred
+                          proxy enforcer consumes them).
+                        properties:
+                          header:
+                            type: string
+                          pathReplace:
+                            type: string
+                          type:
+                            enum:
+                            - SetHeader
+                            - AddHeader
+                            - RemoveHeader
+                            - RewritePath
+                            type: string
+                          value:
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      type: array
+                    name:
+                      description: Name is a human label for the rule, surfaced in
+                        logs and metrics.
+                      type: string
+                  required:
+                  - action
+                  type: object
+                type: array
+            type: object
+          status:
+            description: EgressPolicyStatus is the observed state, shared by both
+              kinds.
+            properties:
+              conditions:
+                description: |-
+                  Conditions report acceptance state. Type "Accepted" is True when the spec
+                  validates and False (with a reason) otherwise.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: ObservedGeneration is the .metadata.generation the controller
+                  last validated.
+                format: int64
+                type: integer
+              ruleCount:
+                description: RuleCount is the number of rules in the validated spec.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

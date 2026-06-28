@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+
+# ── build stage: compile the operator manager (pure Go, no eBPF) ────────────
+# The operator only builds ./cmd/operator, whose import graph is api/v1 +
+# internal/controller + internal/policy + controller-runtime — it never reaches
+# internal/egress, so no clang/libbpf and no bpf2go output are needed.
+FROM golang:1.26-trixie AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/ebfw-operator ./cmd/operator
+
+# ── runtime image (nonroot: runs as uid 65532, matches the pod securityContext) ─
+FROM gcr.io/distroless/static-debian12:nonroot AS image
+COPY --from=build /out/ebfw-operator /usr/bin/ebfw-operator
+ENTRYPOINT ["/usr/bin/ebfw-operator"]

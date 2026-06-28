@@ -1,0 +1,76 @@
+# Default values for the ebfw chart.
+
+# nameOverride/fullnameOverride tweak the generated resource names.
+nameOverride: ""
+fullnameOverride: ""
+
+# imagePullSecrets are attached to the operator + agent pods.
+imagePullSecrets: []
+
+# operator is the control-plane controller (a Deployment). It validates
+# EgressPolicy/ClusterEgressPolicy and records their status; it does NOT program
+# the datapath.
+operator:
+  enabled: true
+  image:
+    repository: ghcr.io/dvrkn/ebfw-operator
+    # tag defaults to .Chart.appVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 1
+  # leaderElect lets you run >1 replica safely (only one reconciles).
+  leaderElect: true
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# agent is the per-node eBPF DaemonSet. It needs privileged + hostNetwork +
+# hostPID and host cgroup/bpffs mounts.
+agent:
+  enabled: true
+  image:
+    repository: ghcr.io/dvrkn/ebfw
+    # tag defaults to .Chart.appVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # enforceMode: off (observe-only) | log (annotate, no drops) | enforce (drop).
+  enforceMode: "off"
+  # policySource: crd (watch the CRDs — the default for Helm installs) | file.
+  policySource: "crd"
+  # output: text | json.
+  output: "text"
+  metricsAddr: ":9090"
+  inspect:
+    paths: true
+    headers: true
+    body: false
+  # exclude is the internal-traffic filter compiled into the agent config.yaml.
+  exclude:
+    cidrs:
+      - 127.0.0.0/8
+      - ::1/128
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 169.254.0.0/16
+      - fe80::/10
+      - fc00::/7
+    domainSuffixes:
+      - cluster.local
+      - svc
+      - local
+      - in-addr.arpa
+      - ip6.arpa
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  # tolerations default to "run on every node".
+  tolerations:
+    - operator: Exists

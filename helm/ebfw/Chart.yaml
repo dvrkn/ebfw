@@ -1,0 +1,18 @@
+apiVersion: v2
+name: ebfw
+description: |
+  ebfw — eBPF egress visibility + enforcement for Kubernetes. Installs the
+  EgressPolicy / ClusterEgressPolicy CRDs, the control-plane operator that
+  validates them, and the per-node agent DaemonSet that watches the CRDs and
+  programs the cgroup_skb datapath.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ebpf
+  - egress
+  - network-policy
+  - security
+home: https://github.com/dvrkn/ebfw
+sources:
+  - https://github.com/dvrkn/ebfw
