@@ -32,7 +32,7 @@ func TestParseFlowSpecErrors(t *testing.T) {
 // TestExamplePolicyEvaluates exercises the shipped example policy end-to-end
 // through the test subcommand: it must load, validate, and evaluate flows.
 func TestExamplePolicyEvaluates(t *testing.T) {
-	const policyPath = "../../deploy/policy.example.yaml"
+	const policyPath = "../../examples/policy.yaml"
 	cases := []struct {
 		name string
 		args []string
