@@ -4,7 +4,6 @@ package l7
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"strings"
 )
 
@@ -63,11 +62,4 @@ func ParseRequest(payload []byte) (*Request, bool) {
 		}
 	}
 	return r, true
-}
-
-// PrintHeaders writes the request headers indented under a request line.
-func PrintHeaders(headers []Header) {
-	for _, h := range headers {
-		fmt.Printf("           %s: %s\n", h.Name, h.Value)
-	}
 }

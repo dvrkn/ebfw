@@ -17,8 +17,11 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/net/dns/dnsmessage"
 
+	"github.com/dvrkn/ebfw/internal/attr"
 	"github.com/dvrkn/ebfw/internal/config"
 	"github.com/dvrkn/ebfw/internal/l7"
+	"github.com/dvrkn/ebfw/internal/metrics"
+	"github.com/dvrkn/ebfw/internal/output"
 	"github.com/dvrkn/ebfw/internal/tlsparse"
 )
 
@@ -30,12 +33,17 @@ const (
 	evtHTTP    = 4
 )
 
-// hdrLen is the fixed header of struct event in bpf/egress.bpf.c (payload @ 20).
-const hdrLen = 20
+// hdrLen is the fixed header of struct event in bpf/egress.bpf.c. The C struct's
+// field offsets are mirrored by the raw[a:b] slices in handleEvent; keep both in
+// sync with that struct. Layout: evt_type@0 ip_version@1 l4_proto@2 _pad@3
+// saddr@4 daddr@8 sport@12 dport@14 payload_len@16 _pad2@20 cgroup_id@24
+// payload@32.
+const hdrLen = 32
 
 // Run loads and attaches the egress program and reports filtered events until
-// ctx is cancelled. The caller owns rlimit setup and signal handling.
-func Run(ctx context.Context, cfg *config.Config, filter *config.Filter) error {
+// ctx is cancelled, attributing each to its pod via resolver and emitting through
+// sink. The caller owns rlimit setup and signal handling.
+func Run(ctx context.Context, cfg *config.Config, filter *config.Filter, resolver *attr.Resolver, sink output.Sink) error {
 	var objs bpfObjects
 	if err := loadBpfObjects(&objs, nil); err != nil {
 		var ve *ebpf.VerifierError
@@ -79,11 +87,11 @@ func Run(ctx context.Context, cfg *config.Config, filter *config.Filter) error {
 			log.Printf("monitor ringbuf read: %v", err)
 			continue
 		}
-		handleEvent(rec.RawSample, filter, cfg.Inspect, seen)
+		handleEvent(rec.RawSample, filter, cfg.Inspect, resolver, sink, seen)
 	}
 }
 
-func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, seen map[string]struct{}) {
+func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, resolver *attr.Resolver, sink output.Sink, seen map[string]struct{}) {
 	if len(raw) < hdrLen {
 		return
 	}
@@ -92,6 +100,7 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, s
 	dst := net.IP(raw[8:12])
 	dport := binary.BigEndian.Uint16(raw[14:16])
 	plen := binary.LittleEndian.Uint32(raw[16:20])
+	cgroupID := binary.LittleEndian.Uint64(raw[24:32])
 
 	var payload []byte
 	if plen > 0 && hdrLen+int(plen) <= len(raw) {
@@ -101,6 +110,7 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, s
 	switch evtType {
 	case evtConnect:
 		if filter.SkipIP(dst) {
+			metrics.FilteredTotal.WithLabelValues(string(output.KindConnect)).Inc()
 			return
 		}
 		key := "c|" + src.String() + "|" + dst.String() + "|" + fmt.Sprint(dport)
@@ -108,32 +118,54 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, s
 			return
 		}
 		seen[key] = struct{}{}
-		fmt.Printf("%-8s %s -> %s:%d\n", "CONNECT", src, dst, dport)
+		sink.Emit(output.Event{
+			Kind: output.KindConnect, Src: src.String(), Dst: dst.String(), Port: int(dport),
+			Pod: resolver.ByCgroupID(cgroupID),
+		})
 
 	case evtDNS:
+		pod := resolver.ByCgroupID(cgroupID)
 		for _, q := range dnsQuestions(payload) {
 			if filter.SkipDomain(q.name) {
+				metrics.FilteredTotal.WithLabelValues(string(output.KindDNS)).Inc()
 				continue
 			}
-			fmt.Printf("%-8s %s ? %s (%s)\n", "DNS", src, q.name, q.typ)
+			sink.Emit(output.Event{
+				Kind: output.KindDNS, Src: src.String(), Domain: q.name, DNSType: q.typ, Pod: pod,
+			})
 		}
 
 	case evtTLS:
 		sni, err := tlsparse.ServerName(payload)
-		if err != nil || filter.SkipDomain(sni) || filter.SkipIP(dst) {
+		if err != nil {
 			return
 		}
-		fmt.Printf("%-8s %s -> %s  (%s:%d)\n", "TLS", src, sni, dst, dport)
+		if filter.SkipDomain(sni) || filter.SkipIP(dst) {
+			metrics.FilteredTotal.WithLabelValues(string(output.KindTLS)).Inc()
+			return
+		}
+		sink.Emit(output.Event{
+			Kind: output.KindTLS, Src: src.String(), Domain: sni, Dst: dst.String(), Port: int(dport),
+			Pod: resolver.ByCgroupID(cgroupID),
+		})
 
 	case evtHTTP:
 		req, ok := l7.ParseRequest(payload)
-		if !ok || filter.SkipDomain(req.Host) || filter.SkipIP(dst) {
+		if !ok {
 			return
 		}
-		fmt.Printf("%-8s %s -> %s %s%s\n", "HTTP", src, req.Method, req.Host, req.Path)
-		if inspect.Headers {
-			l7.PrintHeaders(req.Headers)
+		if filter.SkipDomain(req.Host) || filter.SkipIP(dst) {
+			metrics.FilteredTotal.WithLabelValues(string(output.KindHTTP)).Inc()
+			return
 		}
+		ev := output.Event{
+			Kind: output.KindHTTP, Src: src.String(), Method: req.Method, Domain: req.Host, Path: req.Path,
+			Dst: dst.String(), Port: int(dport), Pod: resolver.ByCgroupID(cgroupID),
+		}
+		if inspect.Headers {
+			ev.Headers = req.Headers
+		}
+		sink.Emit(ev)
 	}
 }
 

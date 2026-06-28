@@ -22,8 +22,11 @@ import (
 
 	"github.com/cilium/ebpf/rlimit"
 
+	"github.com/dvrkn/ebfw/internal/attr"
 	"github.com/dvrkn/ebfw/internal/config"
 	"github.com/dvrkn/ebfw/internal/egress"
+	"github.com/dvrkn/ebfw/internal/metrics"
+	"github.com/dvrkn/ebfw/internal/output"
 	"github.com/dvrkn/ebfw/internal/sslsnoop"
 )
 
@@ -37,7 +40,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("ebfw: %v", err)
 	}
-	cfg.Inspect = config.InspectionFromEnv()
+	cfg.FromEnv()
 
 	filter, err := cfg.Filter()
 	if err != nil {
@@ -52,6 +55,19 @@ func main() {
 		log.Printf("ebfw: EBFW_INSPECT_BODY is set, but request-body inspection is not implemented yet (stub)")
 	}
 
+	// Pod attribution: node-local cgroup parsing, best-effort enriched with
+	// namespace/name from the Kubernetes API. Off-cluster, enrichment no-ops and
+	// only the node-local identity is reported.
+	enricher, err := attr.NewK8sEnricher(cfg.NodeName)
+	if err != nil {
+		log.Printf("ebfw: pod-name enrichment disabled (%v); using node-local identity only", err)
+	}
+	resolver := attr.NewResolver(cfg.Cgroup, enricher)
+	defer resolver.Close()
+
+	sink := output.New(cfg.Output)
+	go metrics.Serve(cfg.MetricsAddr)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -63,7 +79,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := sslsnoop.Run(ctx, cfg, filter); err != nil {
+			if err := sslsnoop.Run(ctx, cfg, filter, resolver, sink); err != nil {
 				log.Printf("ebfw: path inspection stopped: %v", err)
 			}
 		}()
@@ -75,7 +91,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := egress.Run(ctx, cfg, filter); err != nil {
+		if err := egress.Run(ctx, cfg, filter, resolver, sink); err != nil {
 			log.Printf("ebfw: monitor stopped: %v", err)
 			stop()
 		}

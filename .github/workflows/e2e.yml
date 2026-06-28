@@ -38,3 +38,19 @@ jobs:
 
       - name: End-to-end test (eBPF; needs root)
         run: sudo ./test/e2e.sh bin/ebfw
+
+  k8s:
+    # Full Kubernetes e2e: deploy to a throwaway k3d cluster and assert pod
+    # attribution (DNS/TLS/HTTP/HTTPS), metrics, and JSON output. The image is
+    # built inside Docker by the script, so no Go/clang toolchain is needed here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d
+        # kubectl and jq are preinstalled on ubuntu-24.04 runners.
+        run: curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | sudo bash
+
+      - name: Kubernetes e2e (k3d)
+        run: ./test/k8s.sh

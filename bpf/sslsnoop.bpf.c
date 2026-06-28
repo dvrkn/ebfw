@@ -30,11 +30,15 @@ char LICENSE[] SEC("license") = "GPL";
 // barrier_var() is provided by bpf_helpers.h; it pins a value in one register
 // so the verifier's bound on it survives to the helper call.
 
+// Field offsets are mirrored by hand in internal/sslsnoop/sslsnoop.go (hdrLen +
+// the buf[a:b] slices). Keep them in sync. Layout: pid@0 data_len@4 comm@8(16)
+// ssl@24 cgroup_id@32 data@40.
 struct ssl_event {
 	__u32 pid;
 	__u32 data_len;
 	__u8  comm[COMM_LEN];
-	__u64 ssl;   // SSL* — per-connection key for HTTP/2 HPACK state
+	__u64 ssl;        // SSL* — per-connection key for HTTP/2 HPACK state
+	__u64 cgroup_id;  // cgroup v2 id of the calling task — pod attribution
 	__u8  data[MAX_DATA];
 };
 
@@ -57,6 +61,10 @@ int BPF_UPROBE(ssl_write, void *ssl, const void *buf, int num)
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->ssl = (__u64)(unsigned long)ssl;
+	// cgroup v2 id of the calling task, captured here (in process context) so
+	// attribution doesn't race the process exiting — short-lived TLS clients
+	// (curl, etc.) are often gone before userspace could read /proc.
+	e->cgroup_id = bpf_get_current_cgroup_id();
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
 	// Same verifier-friendly clamp as the egress program: __u64 + clamp +
