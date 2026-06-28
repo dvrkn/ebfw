@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Stage-3 CRD end-to-end: install the full stack via the Helm chart (CRDs +
+# Kubernetes end-to-end: install the full stack via the Helm chart (CRDs +
 # operator + agent with EBFW_POLICY_SOURCE=crd, enforce mode) on a throwaway k3d
-# cluster, then assert the CRD-driven path the file-based k8s.sh does not:
+# cluster, then assert the full CRD-driven path:
+#   - pod attribution (DNS/TLS/HTTP/HTTPS events attributed to the originating pod)
 #   - the operator validates resources and stamps status.conditions[Accepted]
 #   - an EgressPolicy deny is programmed by the agent and attributed to the pod
 #   - a namespaced defaultAction:Deny default-denies ONLY that namespace's pods,
