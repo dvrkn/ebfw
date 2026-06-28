@@ -110,6 +110,54 @@ Two layers:
   | `EBFW_OUTPUT` | `text` | event format: `text` or `json` (one object per line) |
   | `EBFW_METRICS_ADDR` | `:9090` | Prometheus `/metrics` listen address (empty disables) |
   | `EBFW_NODE_NAME` | _(unset)_ | this node's name (set via the downward API); scopes the pod informer |
+  | `EBFW_ENFORCE_MODE` | `off` | egress enforcement: `off` / `log` / `enforce` (see below) |
+  | `EBFW_POLICY` | _(unset)_ | path to the egress policy YAML |
+  | `EBFW_ENFORCE_DRY_RUN` | `false` | in `enforce` mode, program the datapath but suppress drops (canary) |
+
+### Enforcement (Stage 2)
+
+The agent can evaluate an egress **policy** (allow/deny per pod by
+domain/IP/CIDR/port) loaded from a YAML file (`EBFW_POLICY`) — the same schema
+that will back the Stage-3 `EgressPolicy` CRD. See
+[`deploy/policy.example.yaml`](deploy/policy.example.yaml).
+
+`EBFW_ENFORCE_MODE` selects the behavior:
+
+- **`off`** (default) — observe-only; policy ignored.
+- **`log`** — evaluate each connection-level event and annotate it with the
+  verdict (`action=deny rule=…` in text, `"action"`/`"rule"` in JSON) **without
+  dropping** anything. A safe dry-run to validate a policy against live traffic.
+- **`enforce`** — drop denied egress. Denied IPv4 TCP `connect()` fails fast with
+  `EPERM` (the `cgroup/connect4` hook); anything else denied is dropped at the
+  `cgroup_skb/egress` hook (the SYN is dropped → connection times out).
+  `EBFW_ENFORCE_DRY_RUN=true` programs the datapath and stamps verdicts but
+  suppresses the drop, as a canary.
+
+What `enforce` drops today: per-pod (or node-global) **IP/CIDR** and **CIDR+port**
+rules + default posture (Stage 2b), and **domain** rules (Stage 2c) — a
+`cgroup_skb/ingress` hook captures DNS answers and the agent programs the
+resolved IPs into the verdict map, so a domain-blocked connection's SYN is
+dropped. (A domain-blocked flow shows only a `CONNECT` with `action=deny`; the
+SYN never completes, so there's no TLS event carrying the SNI/rule name.)
+**Port-only / L7 (method,path) / IPv6** rules are evaluated for `log`/metrics but
+not yet dropped — the agent logs how many dimensions it couldn't program.
+
+Policy is hot-reloaded on file change (a bad reload is logged and ignored,
+keeping the last good policy). Evaluate a policy offline, no kernel needed:
+
+```bash
+ebfw policy test --policy deploy/policy.example.yaml \
+  --flow 'pod=payments/web dst=203.0.113.5 port=443 domain=api.example.com' \
+  --flow 'domain=evil.com port=443'
+```
+
+`Modify` rules (header injection / path rewrite) are accepted and shown by
+`policy test`, but Stage 2 does not enforce them — that datapath (a terminating
+proxy + TLS MITM) is a deferred, opt-in sub-stage; the cgroup/connect datapath
+treats `Modify` as `Allow`.
+
+For a full k3d walkthrough (deploy, enable a demo blocklist, watch allow/deny
+events attributed per pod), see [`deploy/DEMO.md`](deploy/DEMO.md).
 
 ### Pod attribution
 
@@ -124,9 +172,10 @@ or before the informer has synced, events still carry the node-local identity
 
 `/metrics` (default `:9090`, on `hostNetwork` so reachable on the node) exposes:
 `ebfw_events_total{kind}`, `ebfw_filtered_total{kind}`,
-`ebfw_attribution_total{result}` (hit/miss), and `ebfw_uprobe_attached`. Labels
-are deliberately low-cardinality — pod identity lives in the event lines, not in
-metric labels.
+`ebfw_attribution_total{result}` (hit/miss), `ebfw_uprobe_attached`, and — when
+enforcement is enabled — `ebfw_enforcement_decisions_total{action,mode}` and
+`ebfw_policy_rules`. Labels are deliberately low-cardinality — pod identity
+lives in the event lines, not in metric labels.
 
 ## Requirements
 
@@ -195,14 +244,25 @@ sudo ./test/e2e.sh out/ebfw
   pod UID/container/QoS, enriched to namespace/name via a node-scoped Pods
   informer), structured JSON output, Prometheus metrics. _Remaining and deferred
   to Stage 4: TLS/HTTP multi-segment reassembly and TLS 1.3 ECH handling._
-- **Stage 2 — enforcement (next):** allow/block egress by domain/IP. Learn DNS→IP
-  into an `LPM_TRIE`/`HASH` and drop disallowed egress at the cgroup hook
-  (`return 0`) or a `cgroup/connect4` hook; pin maps so policy updates need no reload.
-- **Stage 3 — operator:** an `EgressPolicy` CRD + controller that programs each
-  node agent's maps.
+- **Stage 2 — enforcement (done):** allow/deny egress per pod by
+  domain / IP / CIDR / port. A pure `internal/policy` engine (the future CRD
+  spec) drives three modes — `off`, `log` (annotate the verdict, no drop), and
+  `enforce` — programming `LRU_HASH` + `LPM_TRIE` verdict maps from the policy.
+  Denials drop at the `cgroup_skb/egress` hook and fail IPv4 TCP `connect()` fast
+  with `EPERM` (`cgroup/connect4`); domain rules are enforced by learning DNS→IP
+  from a `cgroup_skb/ingress` hook (LRU + TTL). Testable as a plain binary via
+  `ebfw policy test`; host + k3d e2e coverage. _Deferred: `connect6` / IPv6
+  enforcement, an in-kernel TLS-SNI/HTTP-Host drop backstop (limited by ECH),
+  pinned maps for the Stage-3 controller, and request **modify** (header
+  injection / path rewrite — needs a terminating L7 proxy + TLS MITM; modeled in
+  the policy now but not enforced)._
+- **Stage 3 — operator:** an `EgressPolicy` CRD (its spec is `policy.Policy`) +
+  controller that programs each node agent's pinned maps via a new
+  `PolicySource`.
 - **Stage 4 — hardening:** TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, IPv6
-  extension-header parsing, cgroup-v1 fallback, request-body inspection, uprobe
-  coverage beyond OpenSSL-dynamic, multi-kernel CI, HA, scale tests.
+  extension-header parsing + enforcement, cgroup-v1 fallback, request-body
+  inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI, HA, scale
+  tests.
 
 ---
 

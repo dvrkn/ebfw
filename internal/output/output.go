@@ -45,6 +45,13 @@ type Event struct {
 	PID     int    // SSL_write uprobe
 	Comm    string // SSL_write uprobe
 	Pod     attr.PodInfo
+	// Action is the policy verdict for the flow ("allow"/"deny"/"modify"), set
+	// by the enforcement layer; empty when enforcement is off or the kind is not
+	// connection-level (e.g. dns, which is always permitted). In log mode it is
+	// the verdict that *would* apply; in enforce mode it reflects the datapath.
+	// Rule is the name of the matched rule ("" = matched the default posture).
+	Action string
+	Rule   string
 }
 
 // Sink consumes events. Implementations are safe for concurrent use: the egress
@@ -79,6 +86,19 @@ func podSuffix(p attr.PodInfo) string {
 	return ""
 }
 
+// actionSuffix renders the trailing " action=... rule=..." policy verdict for
+// text output (empty when enforcement did not annotate the event).
+func actionSuffix(e Event) string {
+	if e.Action == "" {
+		return ""
+	}
+	s := "  action=" + e.Action
+	if e.Rule != "" {
+		s += " rule=" + e.Rule
+	}
+	return s
+}
+
 type textSink struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -90,15 +110,15 @@ func (s *textSink) Emit(e Event) {
 	defer s.mu.Unlock()
 	switch e.Kind {
 	case KindConnect:
-		fmt.Fprintf(s.w, "%-8s %s -> %s:%d%s\n", "CONNECT", e.Src, e.Dst, e.Port, podSuffix(e.Pod))
+		fmt.Fprintf(s.w, "%-8s %s -> %s:%d%s%s\n", "CONNECT", e.Src, e.Dst, e.Port, podSuffix(e.Pod), actionSuffix(e))
 	case KindDNS:
 		fmt.Fprintf(s.w, "%-8s %s ? %s (%s)%s\n", "DNS", e.Src, e.Domain, e.DNSType, podSuffix(e.Pod))
 	case KindTLS:
-		fmt.Fprintf(s.w, "%-8s %s -> %s  (%s:%d)%s\n", "TLS", e.Src, e.Domain, e.Dst, e.Port, podSuffix(e.Pod))
+		fmt.Fprintf(s.w, "%-8s %s -> %s  (%s:%d)%s%s\n", "TLS", e.Src, e.Domain, e.Dst, e.Port, podSuffix(e.Pod), actionSuffix(e))
 	case KindHTTP:
-		fmt.Fprintf(s.w, "%-8s %s -> %s %s%s%s\n", "HTTP", e.Src, e.Method, e.Domain, e.Path, podSuffix(e.Pod))
+		fmt.Fprintf(s.w, "%-8s %s -> %s %s%s%s%s\n", "HTTP", e.Src, e.Method, e.Domain, e.Path, podSuffix(e.Pod), actionSuffix(e))
 	case KindHTTPS:
-		fmt.Fprintf(s.w, "HTTPS  [pid=%d %s] %s %s%s%s\n", e.PID, e.Comm, e.Method, e.Domain, e.Path, podSuffix(e.Pod))
+		fmt.Fprintf(s.w, "HTTPS  [pid=%d %s] %s %s%s%s%s\n", e.PID, e.Comm, e.Method, e.Domain, e.Path, podSuffix(e.Pod), actionSuffix(e))
 	}
 	for _, h := range e.Headers {
 		fmt.Fprintf(s.w, "           %s: %s\n", h.Name, h.Value)
@@ -138,6 +158,8 @@ type jsonEvent struct {
 	PID     int          `json:"pid,omitempty"`
 	Comm    string       `json:"comm,omitempty"`
 	Pod     *jsonPod     `json:"pod,omitempty"`
+	Action  string       `json:"action,omitempty"`
+	Rule    string       `json:"rule,omitempty"`
 }
 
 func (s *jsonSink) Emit(e Event) {
@@ -154,6 +176,8 @@ func (s *jsonSink) Emit(e Event) {
 		Path:    e.Path,
 		PID:     e.PID,
 		Comm:    e.Comm,
+		Action:  e.Action,
+		Rule:    e.Rule,
 	}
 	for _, h := range e.Headers {
 		je.Headers = append(je.Headers, jsonHeader{Name: h.Name, Value: h.Value})

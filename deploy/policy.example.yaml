@@ -1,0 +1,56 @@
+# Example ebfw egress policy.
+#
+# Applied when the agent runs with EBFW_ENFORCE_MODE=log (evaluate + annotate,
+# no drops) or =enforce (drop denied egress at the kernel datapath). Point the
+# agent at it with EBFW_POLICY=/path/to/policy.yaml.
+#
+# Evaluation: rules are tried in order, first match wins; a rule's match is an
+# AND across the dimensions present (an absent dimension matches anything), and
+# OR within a list (e.g. any of the domains/ports). Flows that match no rule get
+# defaultAction.
+#
+# defaultAction:
+#   Allow -> blocklist: permit everything except what a Deny rule matches.
+#   Deny  -> allowlist: permit only what an Allow rule matches (DNS to the
+#            cluster resolver is always permitted so name resolution works).
+
+defaultAction: Deny # allowlist: deny egress unless a rule allows it
+
+rules:
+  # Allow HTTPS to GitHub and its asset CDNs.
+  - name: allow-github
+    action: Allow
+    match:
+      domains: ["github.com", "*.githubusercontent.com", "*.github.io"]
+      ports: [443]
+
+  # Allow a specific upstream API by IP range on 443.
+  - name: allow-payments-api
+    action: Allow
+    match:
+      pod:
+        namespace: payments
+      cidrs: ["203.0.113.0/24"]
+      ports: [443]
+
+  # Explicitly deny SMTP from everywhere (redundant under allowlist, but
+  # documents intent and would also work under defaultAction: Allow).
+  - name: block-smtp
+    action: Deny
+    match:
+      ports: [25, 465, 587]
+
+  # Modify is modeled for the roadmap (header injection / path rewrite via a
+  # future opt-in proxy). It validates and shows in `policy test`, but is not
+  # enforced yet — the cgroup/connect datapath treats it as Allow.
+  - name: tag-internal-api
+    action: Modify
+    match:
+      pod:
+        labels:
+          team: platform
+      domains: ["api.internal.example.com"]
+    mutations:
+      - type: SetHeader
+        header: X-Egress-Checked
+        value: "ebfw"

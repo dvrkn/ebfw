@@ -104,6 +104,24 @@ func (r *Resolver) ByCgroupID(id uint64) PodInfo {
 	return r.enrich(ent.id)
 }
 
+// Pods walks the cgroup tree and returns the current pod cgroups keyed by
+// cgroup id, each resolved (and best-effort enriched) to a PodInfo. The
+// enforcement programmer uses it to map a pod selector to the cgroup ids it
+// must program. The walk also refreshes the resolver's inode index.
+func (r *Resolver) Pods() map[uint64]PodInfo {
+	idx := buildInoIndex(r.root)
+	out := make(map[uint64]PodInfo, len(idx))
+	for id, path := range idx {
+		if pid, ok := ParsePath(path); ok {
+			out[id] = r.enrich(pid)
+		}
+	}
+	r.mu.Lock()
+	r.inoIndex = idx
+	r.mu.Unlock()
+	return out
+}
+
 // lookupPath returns the cgroup path for a cgroup id, rebuilding the inode index
 // once on a miss (a new pod appeared since the last walk).
 func (r *Resolver) lookupPath(id uint64) (string, bool) {
