@@ -5,3 +5,9 @@ ebpf-skill/
 *.o
 *_bpfel.go
 *_bpfeb.go
+# Not needed to build the binary; excluding keeps the Docker build cache stable
+# when only docs / manifests / tests change.
+test/
+deploy/
+.github/
+*.md

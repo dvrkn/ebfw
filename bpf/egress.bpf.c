@@ -39,17 +39,23 @@ char LICENSE[] SEC("license") = "GPL";
 // pitfall). See libbpf's bpf_helpers.h barrier_var().
 #define barrier_var(var) asm volatile("" : "+r"(var))
 
+// Field offsets are mirrored by hand in internal/egress/egress.go (hdrLen + the
+// raw[a:b] slices). If you change this layout, change that file in lockstep.
+// _pad2 keeps cgroup_id 8-byte aligned so the leading fields (offsets 0..19)
+// stay put and only the header tail moves.
 struct event {
-	__u8  evt_type;     // EVT_*
-	__u8  ip_version;   // 4 (IPv6 is a later stage)
-	__u8  l4_proto;     // IPPROTO_TCP / IPPROTO_UDP
-	__u8  _pad;
-	__be32 saddr;       // network byte order
-	__be32 daddr;       // network byte order
-	__be16 sport;       // network byte order
-	__be16 dport;       // network byte order
-	__u32 payload_len;  // bytes filled in payload[]
-	__u8  payload[MAX_PAYLOAD];
+	__u8  evt_type;     // off 0   EVT_*
+	__u8  ip_version;   // off 1   4 (IPv6 is a later stage)
+	__u8  l4_proto;     // off 2   IPPROTO_TCP / IPPROTO_UDP
+	__u8  _pad;         // off 3
+	__be32 saddr;       // off 4   network byte order
+	__be32 daddr;       // off 8   network byte order
+	__be16 sport;       // off 12  network byte order
+	__be16 dport;       // off 14  network byte order
+	__u32 payload_len;  // off 16  bytes filled in payload[]
+	__u32 _pad2;        // off 20  align cgroup_id to 8
+	__u64 cgroup_id;    // off 24  cgroup v2 id of the sending pod (0 = unknown)
+	__u8  payload[MAX_PAYLOAD]; // off 32
 };
 
 struct {
@@ -76,6 +82,11 @@ static __always_inline void submit_event(struct __sk_buff *skb,
 	e->sport      = sport;
 	e->dport      = dport;
 	e->payload_len = 0;
+	e->_pad2      = 0;
+	// cgroup v2 id of the skb's sending socket — the pod that emitted this
+	// packet. Returns 0 when the skb has no cgroup association; userspace
+	// treats 0 as "unknown" and skips attribution.
+	e->cgroup_id  = bpf_skb_cgroup_id(skb);
 
 	// payload_avail comes from a packet-pointer subtraction, so the verifier
 	// treats it as an unbounded scalar. Clamp it, pin it in one register with

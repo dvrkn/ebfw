@@ -21,6 +21,30 @@ type Config struct {
 	// Inspect controls L7 inspection depth. Sourced from env (a ConfigMap),
 	// not from the YAML file.
 	Inspect Inspection `yaml:"-"`
+	// Output selects the event format: "text" (default) or "json" (EBFW_OUTPUT).
+	Output string `yaml:"-"`
+	// MetricsAddr is the listen address for the Prometheus /metrics endpoint
+	// (EBFW_METRICS_ADDR); empty disables it.
+	MetricsAddr string `yaml:"-"`
+	// NodeName scopes the pod-attribution informer to this node (EBFW_NODE_NAME,
+	// set via the downward API). Empty falls back to watching all pods.
+	NodeName string `yaml:"-"`
+}
+
+// FromEnv populates the env-sourced runtime fields (inspection depth, output
+// format, metrics address, node name). Filtering still comes from the YAML file.
+func (c *Config) FromEnv() {
+	c.Inspect = InspectionFromEnv()
+	c.Output = envStr("EBFW_OUTPUT", "text")
+	c.MetricsAddr = envStr("EBFW_METRICS_ADDR", ":9090")
+	c.NodeName = strings.TrimSpace(os.Getenv("EBFW_NODE_NAME"))
+}
+
+func envStr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
 // Inspection controls how deeply HTTP/HTTPS requests are inspected. These are
