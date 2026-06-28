@@ -1,0 +1,24 @@
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata:
+  name: allow-github
+  namespace: default
+spec:
+  # Allowlist for pods in this namespace: deny by default, allow only the rules
+  # below. defaultAction: Deny here default-denies ONLY this namespace's pods —
+  # never the whole node (that requires a ClusterEgressPolicy).
+  defaultAction: Deny
+  rules:
+    - name: allow-dns
+      action: Allow
+      match:
+        ports: [53]
+    - name: allow-github
+      action: Allow
+      match:
+        domains: ["github.com", "*.githubusercontent.com", "*.github.io"]
+        ports: [443]
+    - name: block-smtp
+      action: Deny
+      match:
+        ports: [25, 465, 587]

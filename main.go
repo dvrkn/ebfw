@@ -26,10 +26,12 @@ import (
 	"syscall"
 
 	"github.com/cilium/ebpf/rlimit"
+	"k8s.io/client-go/rest"
 
 	"github.com/dvrkn/ebfw/internal/attr"
 	"github.com/dvrkn/ebfw/internal/cli"
 	"github.com/dvrkn/ebfw/internal/config"
+	"github.com/dvrkn/ebfw/internal/crdsource"
 	"github.com/dvrkn/ebfw/internal/egress"
 	"github.com/dvrkn/ebfw/internal/enforce"
 	"github.com/dvrkn/ebfw/internal/metrics"
@@ -138,29 +140,48 @@ func setupEnforcement(ctx context.Context, cfg *config.Config, inner output.Sink
 		log.Fatalf("ebfw: invalid EBFW_ENFORCE_MODE %q (want off, log, or enforce)", mode)
 	}
 
-	var src policy.PolicySource
-	if cfg.Enforce.PolicyPath == "" {
-		log.Printf("ebfw: enforcement mode=%s but no EBFW_POLICY; using empty allow-all policy", mode)
-		src = policy.EmptySource()
-	} else {
-		s, err := policy.NewFileSource(cfg.Enforce.PolicyPath)
-		if err != nil {
-			log.Fatalf("ebfw: %v", err)
-		}
-		src = s
-	}
+	src := policySource(ctx, cfg, mode)
 
 	s, err := enforce.NewSink(ctx, src, mode, inner)
 	if err != nil {
 		log.Fatalf("ebfw: %v", err)
 	}
 	p := src.Snapshot()
-	log.Printf("ebfw: enforcement %s — %d rules, default %s, policy=%q",
-		mode, len(p.Rules), p.EffectiveDefault(), cfg.Enforce.PolicyPath)
+	log.Printf("ebfw: enforcement %s — %d rules, default %s, source=%q",
+		mode, len(p.Rules), p.EffectiveDefault(), cfg.Enforce.Source)
 
 	// Only enforce mode programs the kernel datapath. Log mode is userspace-only.
 	if mode == "enforce" {
 		return s, src
 	}
 	return s, nil
+}
+
+// policySource builds the policy source for the configured EBFW_POLICY_SOURCE.
+// "crd" watches the EgressPolicy + ClusterEgressPolicy CRDs in-cluster; if that
+// is unavailable (e.g. off-cluster) it falls back to the file/empty source so
+// the host e2e keeps working. "file" (default) loads EBFW_POLICY, or the empty
+// allow-all policy when unset.
+func policySource(ctx context.Context, cfg *config.Config, mode string) policy.PolicySource {
+	if cfg.Enforce.Source == "crd" {
+		rc, err := rest.InClusterConfig()
+		if err == nil {
+			s, serr := crdsource.New(ctx, rc, cfg.NodeName)
+			if serr == nil {
+				log.Printf("ebfw: enforcement %s — policy source CRD (EgressPolicy + ClusterEgressPolicy)", mode)
+				return s
+			}
+			err = serr
+		}
+		log.Printf("ebfw: CRD policy source unavailable (%v); falling back to file/empty", err)
+	}
+	if cfg.Enforce.PolicyPath == "" {
+		log.Printf("ebfw: enforcement mode=%s but no EBFW_POLICY; using empty allow-all policy", mode)
+		return policy.EmptySource()
+	}
+	s, err := policy.NewFileSource(cfg.Enforce.PolicyPath)
+	if err != nil {
+		log.Fatalf("ebfw: %v", err)
+	}
+	return s
 }

@@ -22,6 +22,8 @@ metadata:
 ---
 # Pod attribution: the agent watches Pods (scoped to its own node via a
 # spec.nodeName field selector) to map cgroup/pod UID -> namespace/name.
+# CRD policy source: when EBFW_POLICY_SOURCE=crd the agent watches the
+# EgressPolicy + ClusterEgressPolicy resources cluster-wide and aggregates them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -29,6 +31,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ebfw.dvrkn.com"]
+    resources: ["egresspolicies", "clusteregresspolicies"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -61,6 +66,10 @@ data:
   # log = evaluate policy and annotate events with the verdict (no drops);
   # enforce = drop denied egress at the kernel datapath.
   enforce-mode: "off"
+  # Policy source: file (default; the policy.yaml below) or crd (watch the
+  # EgressPolicy + ClusterEgressPolicy CRDs — requires the operator/CRDs to be
+  # installed, e.g. via the Helm chart).
+  policy-source: "file"
   policy.yaml: |
     # Egress policy — applied only when enforce-mode is "log" or "enforce".
     #   defaultAction: Allow  -> blocklist (deny only what rules match)
@@ -149,6 +158,9 @@ spec:
             - name: EBFW_ENFORCE_MODE
               valueFrom:
                 configMapKeyRef: { name: ebfw-config, key: enforce-mode }
+            - name: EBFW_POLICY_SOURCE
+              valueFrom:
+                configMapKeyRef: { name: ebfw-config, key: policy-source }
             - name: EBFW_POLICY
               value: /etc/ebfw/policy.yaml
           ports:

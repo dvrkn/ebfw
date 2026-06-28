@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- ebfw_v1_egresspolicy.yaml
+- ebfw_v1_clusteregresspolicy.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
