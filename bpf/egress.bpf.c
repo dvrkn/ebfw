@@ -9,9 +9,10 @@
 //
 // Attached at the node's root cgroup v2, the egress program sees every egress
 // packet from every pod on the node. It does NO protocol parsing itself: it
-// bounds-checks, classifies the packet, and copies the relevant bytes up to
-// userspace via a ring buffer. All DNS/TLS/HTTP parsing happens in Go where
-// loops and string handling are safe.
+// bounds-checks, classifies the packet (IPv4 and IPv6), and copies the relevant
+// bytes up to userspace via a ring buffer. All DNS/TLS/HTTP parsing happens in
+// Go where loops and string handling are safe. Enforcement is IPv4-only for now
+// (the verdict maps are IPv4-keyed); IPv6 is observed but not dropped.
 //
 // Event kinds emitted:
 //   EVT_CONNECT  new TCP connection (SYN & !ACK)        -> dst ip:port
@@ -25,6 +26,7 @@
 #include <linux/if_ether.h>
 #include <linux/in.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
@@ -49,23 +51,24 @@ char LICENSE[] SEC("license") = "GPL";
 // pitfall). See libbpf's bpf_helpers.h barrier_var().
 #define barrier_var(var) asm volatile("" : "+r"(var))
 
-// Field offsets are mirrored by hand in internal/egress/egress.go (hdrLen + the
-// raw[a:b] slices). If you change this layout, change that file in lockstep.
-// _pad2 keeps cgroup_id 8-byte aligned so the leading fields (offsets 0..19)
-// stay put and only the header tail moves.
+// Field offsets are mirrored by hand in internal/egress/egress.go (parseHeader).
+// If you change this layout, change that file in lockstep. Addresses are always
+// 16 bytes so the layout is identical for v4 and v6: ip_version says how many
+// leading bytes are meaningful (4 for IPv4, trailing 12 zeroed; 16 for IPv6).
+// _pad2 keeps cgroup_id 8-byte aligned.
 struct event {
 	__u8  evt_type;     // off 0   EVT_*
-	__u8  ip_version;   // off 1   4 (IPv6 is a later stage)
+	__u8  ip_version;   // off 1   4 or 6
 	__u8  l4_proto;     // off 2   IPPROTO_TCP / IPPROTO_UDP
 	__u8  action;       // off 3   enforcement verdict: ACTION_ALLOW / ACTION_DENY
-	__be32 saddr;       // off 4   network byte order
-	__be32 daddr;       // off 8   network byte order
-	__be16 sport;       // off 12  network byte order
-	__be16 dport;       // off 14  network byte order
-	__u32 payload_len;  // off 16  bytes filled in payload[]
-	__u32 _pad2;        // off 20  align cgroup_id to 8
-	__u64 cgroup_id;    // off 24  cgroup v2 id of the sending pod (0 = unknown)
-	__u8  payload[MAX_PAYLOAD]; // off 32
+	__u8  saddr[16];    // off 4   network byte order (IPv4 in first 4 bytes)
+	__u8  daddr[16];    // off 20  network byte order (IPv4 in first 4 bytes)
+	__be16 sport;       // off 36  network byte order
+	__be16 dport;       // off 38  network byte order
+	__u32 payload_len;  // off 40  bytes filled in payload[]
+	__u32 _pad2;        // off 44  align cgroup_id to 8
+	__u64 cgroup_id;    // off 48  cgroup v2 id of the sending pod (0 = unknown)
+	__u8  payload[MAX_PAYLOAD]; // off 56
 };
 
 struct {
@@ -234,8 +237,14 @@ static __always_inline int verdict_pass(__u8 action, __u8 dry)
 	return 1;         // SK_PASS
 }
 
+// submit_event is version-agnostic: the caller passes the IP version and the skb
+// byte offsets of the source/dest addresses. Addresses are read with
+// bpf_skb_load_bytes (constant length per branch — verifier-safe) into the fixed
+// 16-byte fields, so the L3 header layout never leaks into this helper. action
+// carries the enforcement verdict for the flow.
 static __always_inline void submit_event(struct __sk_buff *skb,
-					 struct iphdr *iph,
+					 __u8 ip_version,
+					 __u32 saddr_off, __u32 daddr_off,
 					 __u8 evt_type, __u8 proto,
 					 __be16 sport, __be16 dport,
 					 __u32 payload_off, __u32 payload_avail,
@@ -246,11 +255,18 @@ static __always_inline void submit_event(struct __sk_buff *skb,
 		return;
 
 	e->evt_type   = evt_type;
-	e->ip_version = 4;
+	e->ip_version = ip_version;
 	e->l4_proto   = proto;
 	e->action     = action;
-	e->saddr      = iph->saddr;
-	e->daddr      = iph->daddr;
+	__builtin_memset(e->saddr, 0, sizeof(e->saddr));
+	__builtin_memset(e->daddr, 0, sizeof(e->daddr));
+	if (ip_version == 6) {
+		bpf_skb_load_bytes(skb, saddr_off, e->saddr, 16);
+		bpf_skb_load_bytes(skb, daddr_off, e->daddr, 16);
+	} else {
+		bpf_skb_load_bytes(skb, saddr_off, e->saddr, 4);
+		bpf_skb_load_bytes(skb, daddr_off, e->daddr, 4);
+	}
 	e->sport      = sport;
 	e->dport      = dport;
 	e->payload_len = 0;
@@ -302,29 +318,63 @@ int egress(struct __sk_buff *skb)
 	void *data     = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
-	// cgroup_skb egress packets start at the network (L3) header.
-	struct iphdr *iph = data;
-	if ((void *)(iph + 1) > data_end)
+	// cgroup_skb egress packets start at the network (L3) header. The high
+	// nibble of the first byte is the IP version (same position for v4 and v6).
+	__u8 *vbyte = data;
+	if ((void *)(vbyte + 1) > data_end)
 		return 1;
-	if (iph->version != 4)
-		return 1; // IPv6 is a later stage
+	__u8 version = *vbyte >> 4;
 
-	__u32 ihl = iph->ihl * 4;
-	if (ihl < sizeof(*iph))
+	// Per-version L3 facts the rest of the program needs: where L4 starts, the
+	// L4 protocol, the skb byte offsets of the src/dst addresses, and (IPv4
+	// only, for enforcement) the destination address.
+	__u8   ip_version;
+	__u8   proto;
+	__u32  l4_off, saddr_off, daddr_off;
+	__be32 v4_daddr = 0;
+
+	if (version == 4) {
+		struct iphdr *iph = data;
+		if ((void *)(iph + 1) > data_end)
+			return 1;
+		__u32 ihl = iph->ihl * 4;
+		if (ihl < sizeof(*iph))
+			return 1;
+		ip_version = 4;
+		proto      = iph->protocol;
+		l4_off     = ihl;
+		saddr_off  = __builtin_offsetof(struct iphdr, saddr);   // 12
+		daddr_off  = __builtin_offsetof(struct iphdr, daddr);   // 16
+		v4_daddr   = iph->daddr;
+	} else if (version == 6) {
+		struct ipv6hdr *ip6h = data;
+		if ((void *)(ip6h + 1) > data_end)
+			return 1;
+		ip_version = 6;
+		// No IPv6 extension-header walk: when nexthdr is not TCP/UDP (a
+		// hop-by-hop/routing/fragment/dest-opts header) the packet falls
+		// through unparsed. Rare on normal egress; see README limitations.
+		proto      = ip6h->nexthdr;
+		l4_off     = sizeof(*ip6h);                              // fixed 40
+		saddr_off  = __builtin_offsetof(struct ipv6hdr, saddr);  // 8
+		daddr_off  = __builtin_offsetof(struct ipv6hdr, daddr);  // 24
+	} else {
 		return 1;
+	}
 
-	void *l4 = (void *)iph + ihl;
+	void *l4 = data + l4_off;
 	if (l4 > data_end)
 		return 1;
 
-	// Resolve the enforcement verdict once per packet. When no policy is
-	// programmed this is a single array lookup and we keep the observe-only
-	// cost: act stays ACTION_ALLOW and nothing is dropped.
+	// Resolve the enforcement verdict once per packet (IPv4 only — the verdict
+	// maps are IPv4-keyed; IPv6 is observed but not yet enforced). When no
+	// policy is programmed this is a single array lookup and the observe-only
+	// cost is unchanged: act stays ACTION_ALLOW and nothing is dropped.
 	__u8 dry = 0;
-	int enf = enforce_enabled(&dry);
+	int enf = (ip_version == 4) && enforce_enabled(&dry);
 	__u64 cg = enf ? bpf_skb_cgroup_id(skb) : 0;
 
-	if (iph->protocol == IPPROTO_UDP) {
+	if (proto == IPPROTO_UDP) {
 		struct udphdr *udp = l4;
 		if ((void *)(udp + 1) > data_end)
 			return 1;
@@ -333,30 +383,32 @@ int egress(struct __sk_buff *skb)
 			// DNS is ALWAYS permitted — under default-deny, dropping it
 			// would break name resolution and thus all egress. Use
 			// skb->len (covers non-linear data) for the payload length.
-			__u32 off = ihl + sizeof(*udp);
+			__u32 off = l4_off + sizeof(*udp);
 			__u32 avail = (off < skb->len) ? (skb->len - off) : 0;
-			submit_event(skb, iph, EVT_DNS, IPPROTO_UDP,
+			submit_event(skb, ip_version, saddr_off, daddr_off,
+				     EVT_DNS, IPPROTO_UDP,
 				     udp->source, udp->dest, off, avail, ACTION_ALLOW);
 			return 1;
 		}
 		if (enf) {
-			__u8 act = verdict_for(cg, iph->daddr, udp->dest);
+			__u8 act = verdict_for(cg, v4_daddr, udp->dest);
 			return verdict_pass(act, dry);
 		}
 		return 1;
 	}
 
-	if (iph->protocol == IPPROTO_TCP) {
+	if (proto == IPPROTO_TCP) {
 		struct tcphdr *tcp = l4;
 		if ((void *)(tcp + 1) > data_end)
 			return 1;
 
-		__u8 act = enf ? verdict_for(cg, iph->daddr, tcp->dest) : ACTION_ALLOW;
+		__u8 act = enf ? verdict_for(cg, v4_daddr, tcp->dest) : ACTION_ALLOW;
 
 		// New connection: SYN set, ACK clear. No payload to copy. Emit the
 		// event (with its verdict) before any drop so denials are visible.
 		if (tcp->syn && !tcp->ack)
-			submit_event(skb, iph, EVT_CONNECT, IPPROTO_TCP,
+			submit_event(skb, ip_version, saddr_off, daddr_off,
+				     EVT_CONNECT, IPPROTO_TCP,
 				     tcp->source, tcp->dest, 0, 0, act);
 
 		__u32 doff = tcp->doff * 4;
@@ -367,7 +419,7 @@ int egress(struct __sk_buff *skb)
 		// egress, so direct packet access (data/data_end) can't see it.
 		// Classify via bpf_skb_load_bytes, which reads across the whole skb
 		// and bounds against skb->len.
-		__u32 off = ihl + doff;
+		__u32 off = l4_off + doff;
 		if (off >= skb->len)
 			return verdict_pass(act, dry); // no payload (pure ACK, etc.)
 		__u32 avail = skb->len - off;
@@ -380,10 +432,12 @@ int egress(struct __sk_buff *skb)
 
 		if (hdr[0] == 0x16 && hdr[5] == 0x01) {
 			// TLS handshake record carrying a ClientHello.
-			submit_event(skb, iph, EVT_TLS, IPPROTO_TCP,
+			submit_event(skb, ip_version, saddr_off, daddr_off,
+				     EVT_TLS, IPPROTO_TCP,
 				     tcp->source, tcp->dest, off, avail, act);
 		} else if (looks_like_http(hdr[0], hdr[1], hdr[2], hdr[3])) {
-			submit_event(skb, iph, EVT_HTTP, IPPROTO_TCP,
+			submit_event(skb, ip_version, saddr_off, daddr_off,
+				     EVT_HTTP, IPPROTO_TCP,
 				     tcp->source, tcp->dest, off, avail, act);
 		}
 		return verdict_pass(act, dry);
@@ -393,9 +447,10 @@ int egress(struct __sk_buff *skb)
 }
 
 // dns_ingress captures DNS answers (UDP source port 53) so userspace can learn
-// domain→IP mappings and program per-pod verdicts for domain rules.
-// The receiving socket's cgroup attributes the answer to the querying pod. It
-// never drops — DNS answers are always delivered.
+// domain→IP mappings and program per-pod verdicts for domain rules. The
+// receiving socket's cgroup attributes the answer to the querying pod. IPv4
+// only (the verdict maps are IPv4-keyed); it never drops — DNS answers are
+// always delivered.
 SEC("cgroup_skb/ingress")
 int dns_ingress(struct __sk_buff *skb)
 {
@@ -459,8 +514,9 @@ static __always_inline void emit_connect_deny(__u64 cg, __be32 daddr, __be16 dpo
 	e->ip_version  = 4;
 	e->l4_proto    = IPPROTO_TCP;
 	e->action      = ACTION_DENY;
-	e->saddr       = 0;
-	e->daddr       = daddr;
+	__builtin_memset(e->saddr, 0, sizeof(e->saddr));
+	__builtin_memset(e->daddr, 0, sizeof(e->daddr));
+	__builtin_memcpy(e->daddr, &daddr, sizeof(daddr)); // IPv4 in first 4 bytes
 	e->sport       = 0;
 	e->dport       = dport;
 	e->payload_len = 0;

@@ -79,13 +79,28 @@ kubectl wait --for=condition=Ready pod/probe --timeout=120s || { echo "ERROR: pr
 note "waiting for SSL_write uprobe to attach to probe libssl"
 sleep 6
 
-# curl -4: the packet monitor is IPv4-only (the uprobe is IP-agnostic regardless).
 note "generating traffic"
 kubectl exec probe -- sh -c "
   curl -4 -s -o /dev/null --max-time 15 --http1.1 http://${SHOWN}/k8s/http-path   || true
   curl -4 -s -o /dev/null --max-time 15 --http1.1 https://${SHOWN}/k8s/https-path || true
   curl -4 -s -o /dev/null --max-time 15           https://${SHOWN}/k8s/h2-path     || true
 " >/dev/null 2>&1 || true
+
+# IPv6 packet path from the pod. k3d's default Docker network is IPv4-only, so
+# this usually has no v6 egress and is skipped. Where it IS available, plaintext
+# HTTP is packet-parser-only, so the path showing up — attributed to the probe
+# pod — proves the v6 parse path resolves through the cgroup hook. (Attribution
+# itself is cgroup-id based and thus IP-version-agnostic.)
+HAVE_V6=0
+if kubectl exec probe -- curl -6 -s -o /dev/null --max-time 8 "https://${SHOWN}/" >/dev/null 2>&1; then
+  HAVE_V6=1
+  note "IPv6 egress available from probe pod — exercising the v6 packet path"
+  kubectl exec probe -- sh -c "
+    curl -6 -s -o /dev/null --max-time 15 --http1.1 http://${SHOWN}/k8s/http6-path || true
+  " >/dev/null 2>&1 || true
+else
+  note "IPv6 egress unavailable from probe pod — skipping v6 packet-path check"
+fi
 sleep 4
 
 # ── collect JSON events and assert fields with jq ───────────────────────────
@@ -111,6 +126,11 @@ assert "TLS attributed to pod"   ".kind==\"tls\"   and .domain==\"${SHOWN}\"    
 assert "HTTP attributed to pod"  ".kind==\"http\"  and .path==\"/k8s/http-path\"  and ${pod}"
 assert "HTTPS attributed to pod" ".kind==\"https\" and .path==\"/k8s/https-path\" and ${pod}"
 assert "pod metadata complete"   '.kind=="https" and .pod.uid!="" and .pod.container!="" and .pod.qos!="" and .pod.node!=""'
+if [ "$HAVE_V6" -eq 1 ]; then
+  assert "HTTP over IPv6 attributed to pod" ".kind==\"http\" and .path==\"/k8s/http6-path\" and ${pod}"
+else
+  echo "SKIP  HTTP over IPv6 attributed to pod (no IPv6 egress from probe pod)"
+fi
 
 # ── metrics (hostNetwork -> reachable on the node IP) ───────────────────────
 node_ip="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"

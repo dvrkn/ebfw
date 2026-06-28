@@ -36,14 +36,59 @@ const (
 )
 
 // hdrLen is the fixed header of struct event in bpf/egress.bpf.c. The C struct's
-// field offsets are mirrored by the raw[a:b] slices in handleEvent; keep both in
-// sync with that struct. Layout: evt_type@0 ip_version@1 l4_proto@2 action@3
-// saddr@4 daddr@8 sport@12 dport@14 payload_len@16 _pad2@20 cgroup_id@24
-// payload@32.
-const hdrLen = 32
+// field offsets are mirrored by parseHeader; keep both in sync with that struct.
+// Addresses are always 16 bytes (ip_version says how many are meaningful: 4 for
+// IPv4, 16 for IPv6), so the layout is identical for both. Layout: evt_type@0
+// ip_version@1 l4_proto@2 action@3 saddr@4(16) daddr@20(16) sport@36 dport@38
+// payload_len@40 _pad2@44 cgroup_id@48 payload@56.
+const hdrLen = 56
 
-// kernel action byte values — must match ACTION_* in bpf/egress.bpf.c.
+// kernel action byte value — must match ACTION_* in bpf/egress.bpf.c.
 const actionDeny = 0
+
+// eventHeader is the decoded fixed header of a ringbuf event. The net.IP fields
+// alias the raw sample, which the caller uses synchronously.
+type eventHeader struct {
+	evtType  uint8
+	action   uint8
+	src, dst net.IP
+	dport    uint16
+	plen     uint32
+	cgroupID uint64
+}
+
+// parseHeader decodes the fixed event header. addrLen follows ip_version: an
+// IPv4 event keeps its address in the first 4 of the 16 reserved bytes, so we
+// slice 4 bytes (net.IP renders it as a dotted quad); IPv6 slices all 16.
+func parseHeader(raw []byte) (eventHeader, bool) {
+	if len(raw) < hdrLen {
+		return eventHeader{}, false
+	}
+	alen := 4
+	if raw[1] == 6 {
+		alen = 16
+	}
+	return eventHeader{
+		evtType:  raw[0],
+		action:   raw[3],
+		src:      net.IP(raw[4 : 4+alen]),
+		dst:      net.IP(raw[20 : 20+alen]),
+		dport:    binary.BigEndian.Uint16(raw[38:40]),
+		plen:     binary.LittleEndian.Uint32(raw[40:44]),
+		cgroupID: binary.LittleEndian.Uint64(raw[48:56]),
+	}, true
+}
+
+// kernelAction renders the in-kernel verdict byte. It is authoritative for
+// connection-level events in enforce mode (the engine cannot re-derive a
+// domain-rule verdict from a bare CONNECT event, since the dropped SYN carries
+// no SNI/Host).
+func kernelAction(b uint8) string {
+	if b == actionDeny {
+		return "Deny"
+	}
+	return "Allow"
+}
 
 // Run loads and attaches the egress program and reports filtered events until
 // ctx is cancelled, attributing each to its pod via resolver and emitting through
@@ -147,33 +192,16 @@ func Run(ctx context.Context, cfg *config.Config, filter *config.Filter, resolve
 	}
 }
 
-// kernelAction renders the in-kernel verdict byte. It is authoritative for
-// connection-level events in enforce mode (the engine cannot re-derive a
-// domain-rule verdict from a bare CONNECT event, since the dropped SYN carries
-// no SNI/Host).
-func kernelAction(b byte) string {
-	if b == actionDeny {
-		return "Deny"
-	}
-	return "Allow"
-}
-
 func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, enforcing bool, resolver *attr.Resolver, sink output.Sink, seen map[string]struct{}) {
-	if len(raw) < hdrLen {
+	h, ok := parseHeader(raw)
+	if !ok {
 		return
 	}
-	evtType := raw[0]
-	action := raw[3]
-	src := net.IP(raw[4:8])
-	dst := net.IP(raw[8:12])
-	dport := binary.BigEndian.Uint16(raw[14:16])
-	plen := binary.LittleEndian.Uint32(raw[16:20])
-	cgroupID := binary.LittleEndian.Uint64(raw[24:32])
 
 	// The kernel stamped the enforcement verdict; count denials (actual drops,
 	// or would-be drops under dry-run). DNS is always allowed, so it never hits.
-	if action == actionDeny {
-		switch evtType {
+	if h.action == actionDeny {
+		switch h.evtType {
 		case evtConnect:
 			metrics.EnforcementDropsTotal.WithLabelValues(string(output.KindConnect)).Inc()
 		case evtTLS:
@@ -188,43 +216,43 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, e
 	// In observe/log mode actStr stays empty and the enforcement sink decides.
 	actStr := ""
 	if enforcing {
-		actStr = kernelAction(action)
+		actStr = kernelAction(h.action)
 	}
 
 	var payload []byte
-	if plen > 0 && hdrLen+int(plen) <= len(raw) {
-		payload = raw[hdrLen : hdrLen+int(plen)]
+	if h.plen > 0 && hdrLen+int(h.plen) <= len(raw) {
+		payload = raw[hdrLen : hdrLen+int(h.plen)]
 	}
 
-	switch evtType {
+	switch h.evtType {
 	case evtConnect:
-		if filter.SkipIP(dst) {
+		if filter.SkipIP(h.dst) {
 			metrics.FilteredTotal.WithLabelValues(string(output.KindConnect)).Inc()
 			return
 		}
 		// Denied connects bypass the new-connection de-dup so every blocked
 		// attempt is visible; allowed connects de-dup to avoid log spam.
-		if action != actionDeny {
-			key := "c|" + src.String() + "|" + dst.String() + "|" + fmt.Sprint(dport)
+		if h.action != actionDeny {
+			key := "c|" + h.src.String() + "|" + h.dst.String() + "|" + fmt.Sprint(h.dport)
 			if _, ok := seen[key]; ok {
 				return
 			}
 			seen[key] = struct{}{}
 		}
 		sink.Emit(output.Event{
-			Kind: output.KindConnect, Src: src.String(), Dst: dst.String(), Port: int(dport),
-			Pod: resolver.ByCgroupID(cgroupID), Action: actStr,
+			Kind: output.KindConnect, Src: h.src.String(), Dst: h.dst.String(), Port: int(h.dport),
+			Pod: resolver.ByCgroupID(h.cgroupID), Action: actStr,
 		})
 
 	case evtDNS:
-		pod := resolver.ByCgroupID(cgroupID)
+		pod := resolver.ByCgroupID(h.cgroupID)
 		for _, q := range dnsQuestions(payload) {
 			if filter.SkipDomain(q.name) {
 				metrics.FilteredTotal.WithLabelValues(string(output.KindDNS)).Inc()
 				continue
 			}
 			sink.Emit(output.Event{
-				Kind: output.KindDNS, Src: src.String(), Domain: q.name, DNSType: q.typ, Pod: pod,
+				Kind: output.KindDNS, Src: h.src.String(), Domain: q.name, DNSType: q.typ, Pod: pod,
 			})
 		}
 
@@ -233,13 +261,13 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, e
 		if err != nil {
 			return
 		}
-		if filter.SkipDomain(sni) || filter.SkipIP(dst) {
+		if filter.SkipDomain(sni) || filter.SkipIP(h.dst) {
 			metrics.FilteredTotal.WithLabelValues(string(output.KindTLS)).Inc()
 			return
 		}
 		sink.Emit(output.Event{
-			Kind: output.KindTLS, Src: src.String(), Domain: sni, Dst: dst.String(), Port: int(dport),
-			Pod: resolver.ByCgroupID(cgroupID), Action: actStr,
+			Kind: output.KindTLS, Src: h.src.String(), Domain: sni, Dst: h.dst.String(), Port: int(h.dport),
+			Pod: resolver.ByCgroupID(h.cgroupID), Action: actStr,
 		})
 
 	case evtHTTP:
@@ -247,13 +275,13 @@ func handleEvent(raw []byte, filter *config.Filter, inspect config.Inspection, e
 		if !ok {
 			return
 		}
-		if filter.SkipDomain(req.Host) || filter.SkipIP(dst) {
+		if filter.SkipDomain(req.Host) || filter.SkipIP(h.dst) {
 			metrics.FilteredTotal.WithLabelValues(string(output.KindHTTP)).Inc()
 			return
 		}
 		ev := output.Event{
-			Kind: output.KindHTTP, Src: src.String(), Method: req.Method, Domain: req.Host, Path: req.Path,
-			Dst: dst.String(), Port: int(dport), Pod: resolver.ByCgroupID(cgroupID), Action: actStr,
+			Kind: output.KindHTTP, Src: h.src.String(), Method: req.Method, Domain: req.Host, Path: req.Path,
+			Dst: h.dst.String(), Port: int(h.dport), Pod: resolver.ByCgroupID(h.cgroupID), Action: actStr,
 		}
 		if inspect.Headers {
 			ev.Headers = req.Headers

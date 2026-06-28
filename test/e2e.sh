@@ -50,12 +50,26 @@ AGENT=$!
 sleep 3   # allow cgroup attach + libssl uprobe discovery
 
 echo "# generating traffic"
-# Force IPv4 (-4): the packet monitor is IPv4-only, so on dual-stack hosts the
-# TLS/HTTP/CONNECT checks need IPv4 egress (the uprobe is IP-agnostic regardless).
+# The packet monitor parses both IPv4 and IPv6. We exercise each explicitly with
+# curl -4 / -6 so the assertions are deterministic on dual-stack hosts.
 curl -4 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "http://${SHOWN}/e2e/http-path"   || true
 curl -4 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/https-path" || true
 curl -4          -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/h2-path"    || true  # HTTP/2 (curl default)
 curl -4 --http1.1 -s -o /dev/null --max-time 10           "https://${HIDDEN}/e2e/should-be-filtered" || true
+
+# IPv6 packet path. GitHub-hosted runners have no IPv6 egress, so gate on a real
+# v6 reachability probe and skip the v6 assertions when it fails. Plaintext HTTP
+# is captured ONLY by the eBPF packet parser (the SSL_write uprobe is HTTPS-only),
+# so a curl -6 plaintext path showing up is decisive proof the v6 parser works.
+HAVE_V6=0
+if curl -6 -s -o /dev/null --max-time 6 "https://${SHOWN}/" 2>/dev/null; then
+  HAVE_V6=1
+  echo "# IPv6 egress available — exercising the v6 packet path"
+  curl -6 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "http://${SHOWN}/e2e/http6-path"   || true
+  curl -6 --http1.1 -s -o /dev/null --max-time 10 -H "$HDR" "https://${SHOWN}/e2e/https6-path" || true
+else
+  echo "# IPv6 egress unavailable — skipping v6 packet-path checks"
+fi
 sleep 2
 
 echo "# scraping metrics (:9090)"
@@ -71,6 +85,7 @@ fail=0
 present()    { if grep -qE "$2" "$log"; then echo "PASS  $1"; else echo "FAIL  $1   [missing: $2]"; fail=1; fi; }
 absent()     { if grep -qE "$2" "$log"; then echo "FAIL  $1   [unexpected: $2]"; fail=1; else echo "PASS  $1"; fi; }
 present_in() { if grep -qE "$3" "$1"; then echo "PASS  $2"; else echo "FAIL  $2   [missing: $3 in $1]"; fail=1; fi; }
+skip()       { echo "SKIP  $1"; }
 
 present "domain (DNS)"              "DNS .* ${SHOWN} "
 present "ssl (TLS SNI)"             "TLS .* ${SHOWN} "
@@ -80,6 +95,17 @@ present "path inspection (HTTP/2)"    "HTTPS .* GET ${SHOWN}/e2e/h2-path"
 present "header inspection"           "${HDR}"
 absent  "internal filter (${HIDDEN})" "${HIDDEN}"
 present_in "$metrics" "metrics endpoint (ebfw_events_total)" "ebfw_events_total"
+
+# IPv6 packet-path assertions (only when v6 egress was available).
+if [ "$HAVE_V6" -eq 1 ]; then
+  # Decisive: plaintext HTTP is packet-parser-only, and we sent it over v6 only.
+  present "http path over IPv6 (plaintext, packet-path)" "HTTP .* GET ${SHOWN}/e2e/http6-path"
+  # A v6 source address (colon-separated) in any event line proves v6 decoding.
+  present "IPv6 address decoded in events" "^[A-Z]+ +[0-9a-fA-F]*:[0-9a-fA-F:]+:"
+else
+  skip "http path over IPv6 (plaintext, packet-path) — no IPv6 egress"
+  skip "IPv6 address decoded in events — no IPv6 egress"
+fi
 
 # ---- JSON output smoke (separate pass; bare host has no pod, so we only assert
 #      structure, not attribution) ----

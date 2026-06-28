@@ -223,9 +223,10 @@ sudo ./test/e2e.sh out/ebfw
 
 ## Limitations
 
-- **IPv4 only** in the packet monitor (IPv6 is stubbed). The `SSL_write` uprobe is
-  IP-agnostic, so HTTPS paths are captured over IPv6 even though the packet-level
-  DNS/TLS/CONNECT are not. Force IPv4 (`curl -4`) to exercise the packet path.
+- **IPv6 extension headers are not parsed.** The packet monitor handles both IPv4
+  and IPv6, but an IPv6 packet whose next-header is not TCP/UDP directly (a
+  hop-by-hop, routing, fragment, or destination-options header) is skipped rather
+  than walked. These are rare on normal egress.
 - **HTTPS paths need OpenSSL-dynamic.** Statically-linked TLS has no `libssl.so`
   to hook — notably Go (`crypto/tls`, often stripped), Java, rustls.
 - **Single segment** — DNS/TLS/HTTP are parsed from the first packet/segment only;
@@ -258,9 +259,10 @@ sudo ./test/e2e.sh out/ebfw
 - **Stage 3 — operator:** an `EgressPolicy` CRD (its spec is `policy.Policy`) +
   controller that programs each node agent's pinned maps via a new
   `PolicySource`.
-- **Stage 4 — hardening:** TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, IPv6,
-  cgroup-v1 fallback, request-body inspection, uprobe coverage beyond
-  OpenSSL-dynamic, multi-kernel CI, HA, scale tests.
+- **Stage 4 — hardening:** TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, IPv6
+  extension-header parsing + enforcement, cgroup-v1 fallback, request-body
+  inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI, HA, scale
+  tests.
 
 ---
 
