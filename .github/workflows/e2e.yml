@@ -67,7 +67,7 @@ jobs:
         run: make test-operator
 
   crd-e2e:
-    # Stage-3 CRD e2e: installs the Helm chart (CRDs + operator + agent watching
+    # CRD e2e: installs the Helm chart (CRDs + operator + agent watching
     # the CRDs in enforce mode) and asserts operator status, CRD-driven denies,
     # the namespaced default-deny semantic, and ClusterEgressPolicy node-wide deny.
     runs-on: ubuntu-24.04
