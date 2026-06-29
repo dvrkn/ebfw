@@ -6,8 +6,9 @@
 
 ### eBPF egress firewall for Kubernetes
 
-*See exactly what every pod talks to — domains, paths, IPs — then allow or deny it.<br/>Attributed per pod. Enforced in the kernel.*
+*See exactly what every pod talks to — domains, paths, headers, IPs — then allow or deny it.<br/>Attributed per pod. Enforced in the kernel.*
 
+[![Website](https://img.shields.io/badge/docs-dvrkn.github.io%2Febfw-F2A93B?logo=githubpages&logoColor=white)](https://dvrkn.github.io/ebfw/)
 [![e2e](https://github.com/dvrkn/ebfw/actions/workflows/e2e.yml/badge.svg)](https://github.com/dvrkn/ebfw/actions/workflows/e2e.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dvrkn/ebfw)](https://goreportcard.com/report/github.com/dvrkn/ebfw)
 [![Go](https://img.shields.io/github/go-mod/go-version/dvrkn/ebfw?logo=go&logoColor=white&color=00ADD8)](go.mod)
@@ -28,7 +29,9 @@ node's root cgroup sees every pod's outbound DNS, TLS SNI, HTTP, and new TCP
 connections; an `SSL_write` uprobe recovers HTTPS request paths before
 encryption. Every event is attributed to the originating pod (`namespace/name`).
 The same in-kernel hooks then **allow or deny egress** per pod by
-domain / IP / CIDR / port, driven by Kubernetes-native `EgressPolicy` CRDs.
+domain / IP / CIDR / port, driven by Kubernetes-native `EgressPolicy` CRDs. It
+also sees HTTP paths and headers and lets policy match on method and path
+(evaluated today; L7 enforcement is on the roadmap).
 
 ## How it works
 
@@ -42,11 +45,26 @@ domain / IP / CIDR / port, driven by Kubernetes-native `EgressPolicy` CRDs.
   `namespace/name` by a node-scoped Pods informer. The same maps carry policy
   verdicts back to the kernel for enforcement.
 
-```
-                       ┌─ cgroup_skb/egress ─ DNS / TLS-SNI / HTTP / CONNECT ─┐
-[ pods on node ] ──────┤                          (+ cgroup id)                ├─► ebfw (Go) ─► attribute ─► text|json
-                       └─ SSL_write uprobe ── HTTPS path (+headers, cgroup id)─┘        │
-                                                                              k8s Pods informer (namespace/name)
+```mermaid
+flowchart LR
+    pods["Pods on node"]
+
+    subgraph kernel["in-kernel (eBPF)"]
+        egress["cgroup_skb/egress<br/>DNS, TLS SNI, HTTP, CONNECT"]
+        uprobe["SSL_write uprobe<br/>HTTPS path + headers"]
+    end
+
+    agent["ebfw agent (Go)<br/>attribute + policy engine"]
+    informer["k8s Pods informer"]
+    out["text / JSON<br/>Prometheus /metrics"]
+
+    pods --> egress
+    pods --> uprobe
+    egress -- "+ cgroup id" --> agent
+    uprobe -- "+ cgroup id" --> agent
+    informer -- "namespace/name" --> agent
+    agent --> out
+    agent -. "allow / deny verdicts" .-> kernel
 ```
 
 ## See it

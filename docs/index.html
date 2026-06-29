@@ -1,0 +1,146 @@
+---
+layout: home
+title: ebfw
+---
+
+<section class="hero">
+  <div class="hero__inner">
+    <img class="hero__logo" src="{{ '/assets/logo.png' | relative_url }}" alt="ebfw logo" width="132" height="132">
+    <h1>ebfw</h1>
+    <p class="hero__sub">eBPF egress firewall for Kubernetes</p>
+    <p class="hero__tag">See exactly what every pod talks to — domains, paths, IPs — then
+      allow or deny it. Attributed per pod. Enforced in the kernel.</p>
+    <div class="hero__cta">
+      <a class="btn btn--primary" href="{{ '/install.html' | relative_url }}">Get started</a>
+      <a class="btn btn--ghost" href="{{ site.github_repo }}">View on GitHub <span aria-hidden="true">↗</span></a>
+    </div>
+    <div class="pills">
+      <span class="pill"><b>One</b> cgroup_skb program · no sidecars</span>
+      <span class="pill pill--honey">kernel ≥ 5.8 · cgroup v2</span>
+      <span class="pill pill--allow">Allow</span>
+      <span class="pill pill--deny">Deny</span>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <p class="eyebrow">How it works</p>
+  <h2>One node agent. Every pod's egress.</h2>
+  <p class="lead">A single <code>cgroup_skb/egress</code> program at the node's root
+    cgroup sees every pod's outbound traffic. An <code>SSL_write</code> uprobe
+    recovers HTTPS paths before encryption. The same in-kernel maps carry policy
+    verdicts back down to drop denied egress.</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card__hex">◳</div>
+      <h3>See every connection</h3>
+      <p>DNS, TLS SNI, plaintext HTTP, and new TCP connections from every pod on the
+        node — no per-pod sidecar, no sampling.</p>
+    </div>
+    <div class="card">
+      <div class="card__hex">⌖</div>
+      <h3>Attributed per pod</h3>
+      <p>Each event is mapped in-kernel via the originating cgroup id and enriched to
+        <code>namespace/name</code> by a node-scoped Pods informer.</p>
+    </div>
+    <div class="card">
+      <div class="card__hex card__hex--allow">✓</div>
+      <h3>Allow &amp; deny in-kernel</h3>
+      <p>Enforce egress by domain / IP / CIDR / port. Denials drop at the cgroup hook
+        and fail IPv4 <code>connect()</code> fast with <code>EPERM</code>.</p>
+    </div>
+    <div class="card">
+      <div class="card__hex card__hex--k8s">⎈</div>
+      <h3>Kubernetes-native</h3>
+      <p>Declare egress as <code>EgressPolicy</code> and <code>ClusterEgressPolicy</code>
+        CRDs. The agent watches them directly; a thin operator records status.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <p class="eyebrow">See it</p>
+  <h2>Read every pod's egress, live</h2>
+  <p class="lead">Text or structured JSON (<code>EBFW_OUTPUT=json</code>), one event per line.</p>
+  <div class="window">
+    <div class="window__bar"><i></i><i></i><i></i><span>kubectl -n ebfw logs -f ds/ebfw</span></div>
+<pre><span class="t-dns">DNS</span>      10.42.0.9 ? example.com (TypeA)  <span class="t-pod">pod=default/probe</span>
+<span class="t-tls">TLS</span>      10.42.0.9 -&gt; example.com  (104.20.23.154:443)  <span class="t-pod">pod=default/probe</span>
+<span class="t-http">HTTP</span>     10.42.0.9 -&gt; GET example.com/foo/bar  <span class="t-pod">pod=default/probe</span>
+<span class="t-https">HTTPS</span>  [pid=2550689 curl] GET <b>example.com/secret/path?token=abc123</b>  <span class="t-pod">pod=default/probe</span>
+<span class="t-conn">CONNECT</span>  10.42.0.9 -&gt; 104.20.23.154:443  <span class="t-pod">pod=default/probe</span>
+<span class="t-deny">DENY</span>     10.42.0.9 -&gt; 1.1.1.1:443  rule=block-public  <span class="t-pod">pod=default/probe</span></pre>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <p class="eyebrow">Control it</p>
+  <h2>Egress as Kubernetes policy</h2>
+  <div class="two-col">
+    <div class="prose-mini">
+      <h3>Three modes, one resource</h3>
+      <p>Roll out safely: start in <b>observe</b>, watch verdicts in <b>log</b>, then
+        flip to <b>enforce</b> to drop. A <code>defaultAction: Deny</code> plus a
+        <code>podSelector</code> locks a labeled set of pods to an allowlist.</p>
+      <div class="pills" style="justify-content:flex-start">
+        <span class="pill"><b>off</b> · observe</span>
+        <span class="pill pill--honey"><b>log</b> · annotate</span>
+        <span class="pill pill--deny"><b>enforce</b> · drop</span>
+      </div>
+      <p style="margin-top:1.2rem"><a href="{{ '/egresspolicy.html' | relative_url }}">Full policy reference →</a></p>
+    </div>
+    <div class="window">
+      <div class="window__bar"><i></i><i></i><i></i><span>frontend-allowlist.yaml</span></div>
+      <div class="highlight"><pre><span class="nt">apiVersion</span>: <span class="s">ebfw.dvrkn.com/v1</span>
+<span class="nt">kind</span>: <span class="s">EgressPolicy</span>
+<span class="nt">metadata</span>:
+  <span class="nt">name</span>: <span class="s">frontend-allowlist</span>
+<span class="nt">spec</span>:
+  <span class="nt">podSelector</span>:
+    <span class="nt">matchLabels</span>: { <span class="nt">app</span>: <span class="s">frontend</span> }
+  <span class="nt">defaultAction</span>: <span class="s">Deny</span>        <span class="c1"># allowlist: deny the rest</span>
+  <span class="nt">rules</span>:
+    - <span class="nt">action</span>: <span class="s">Allow</span>
+      <span class="nt">match</span>: { <span class="nt">domains</span>: [<span class="s">"*.googleapis.com"</span>] }
+    - <span class="nt">action</span>: <span class="s">Allow</span>
+      <span class="nt">match</span>: { <span class="nt">ports</span>: [<span class="m">53</span>] }  <span class="c1"># DNS</span></pre></div>
+    </div>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <p class="eyebrow">Quickstart</p>
+  <h2>Install with Helm</h2>
+  <p class="lead">CRDs, the operator, and the per-node agent DaemonSet — one chart.</p>
+  <div class="window">
+    <div class="window__bar"><i></i><i></i><i></i><span>bash</span></div>
+    <div class="highlight"><pre><span class="gp">$</span> helm install ebfw ./helm/ebfw -n ebfw --create-namespace \
+    --set agent.enforceMode=log     <span class="c1"># observe verdicts; flip to enforce when ready</span>
+
+<span class="gp">$</span> kubectl apply -f config/samples/ebfw_v1_egresspolicy.yaml
+<span class="gp">$</span> kubectl get egp,cegp -A</pre></div>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <p class="eyebrow">Docs</p>
+  <h2>Dig in</h2>
+  <div class="doclinks">
+    <a class="doclink" href="{{ '/install.html' | relative_url }}">
+      <strong>Install &amp; run</strong>
+      <span>Requirements, Helm deploy, host &amp; k3d e2e, and the repo layout.</span>
+      <em>Read →</em>
+    </a>
+    <a class="doclink" href="{{ '/configuration.html' | relative_url }}">
+      <strong>Configuration</strong>
+      <span>Every chart value and agent env var — output, metrics, enforcement.</span>
+      <em>Read →</em>
+    </a>
+    <a class="doclink" href="{{ '/egresspolicy.html' | relative_url }}">
+      <strong>Egress policies</strong>
+      <span>The <code>EgressPolicy</code> / <code>ClusterEgressPolicy</code> CRD reference.</span>
+      <em>Read →</em>
+    </a>
+  </div>
+</section>

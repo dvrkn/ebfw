@@ -3,7 +3,7 @@
 The agent is configured in two layers: a YAML **filter** file (what internal
 traffic to suppress) and a set of **environment variables** (inspection depth,
 output, metrics, enforcement). With the Helm chart these are set via
-[`helm/ebfw/values.yaml`](../helm/ebfw/values.yaml).
+[`helm/ebfw/values.yaml`](https://github.com/dvrkn/ebfw/blob/main/helm/ebfw/values.yaml).
 
 ## Filtering
 
@@ -43,7 +43,7 @@ exclude:
 
 The agent evaluates an egress **policy** (allow/deny per pod by
 domain/IP/CIDR/port) — either a YAML file (`EBFW_POLICY`, see
-[`../examples/policy.yaml`](../examples/policy.yaml)) or the
+[`examples/policy.yaml`](https://github.com/dvrkn/ebfw/blob/main/examples/policy.yaml)) or the
 [EgressPolicy CRDs](egresspolicy.md). `EBFW_ENFORCE_MODE` selects the behavior:
 
 - **`off`** (default) — observe-only; policy ignored.

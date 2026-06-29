@@ -54,8 +54,15 @@ type Policy struct {
 	// it into each rule's pod match and the default-deny catch-all, so the Engine
 	// and Programmer never read it directly.
 	PodSelector *LabelSelector `json:"podSelector,omitempty" yaml:"podSelector,omitempty"`
-	// DefaultAction is applied when no rule matches. Empty defaults to Allow
-	// (blocklist) so an empty/observe policy never breaks egress.
+	// DefaultAction picks the policy's posture — the verdict for a flow that
+	// matches no rule — and is OPTIONAL: empty means Allow (blocklist), so an
+	// empty or observe-only policy never breaks egress. It is NOT inferred from
+	// the presence of rules, because each Rule carries its own Allow/Deny action:
+	//   - blocklist = Deny rules + DefaultAction Allow ("allow all except these")
+	//   - allowlist = Allow rules + DefaultAction Deny ("deny all except these")
+	// A policy of pure Deny rules expects everything else through, so defaulting
+	// to Deny just because rules exist would invert its intent. Set Deny
+	// explicitly to opt into allowlist mode.
 	DefaultAction DefaultPosture `json:"defaultAction,omitempty" yaml:"defaultAction,omitempty"`
 	// Rules are evaluated in order; first match wins.
 	Rules []Rule `json:"rules,omitempty" yaml:"rules,omitempty"`

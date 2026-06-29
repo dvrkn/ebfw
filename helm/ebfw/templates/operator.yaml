@@ -102,7 +102,7 @@ spec:
       containers:
         - name: operator
           image: {{ include "ebfw.operator.image" . | quote }}
-          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          imagePullPolicy: {{ include "ebfw.operator.pullPolicy" . }}
           args:
             - --health-probe-bind-address=:8081
             {{- if .Values.operator.leaderElect }}
