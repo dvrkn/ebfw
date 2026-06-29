@@ -96,7 +96,7 @@ retry_ok() { local n="$1"; shift; local i; for i in $(seq 1 "$n"); do "$@" && re
 # ── probe pods ───────────────────────────────────────────────────────────────
 note "starting probe pods (default/probe, walled/probe2)"
 kubectl create namespace walled >/dev/null 2>&1 || true
-kubectl run probe  --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl run probe  --image=nicolaka/netshoot --labels=app=probe --restart=Never --command -- sleep infinity >/dev/null
 kubectl -n walled run probe2 --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
 kubectl wait --for=condition=Ready pod/probe --timeout=120s >/dev/null || { echo "ERROR: probe not ready"; exit 1; }
 kubectl -n walled wait --for=condition=Ready pod/probe2 --timeout=120s >/dev/null || { echo "ERROR: probe2 not ready"; exit 1; }
@@ -139,13 +139,13 @@ apiVersion: ebfw.dvrkn.com/v1
 kind: EgressPolicy
 metadata: { name: block-probe, namespace: default }
 spec:
-  podSelector: {}            # govern the whole namespace; the rule narrows by pod name
+  podSelector:
+    matchLabels: { app: probe }   # scope this policy to the probe pod (by label)
   defaultAction: Allow
   rules:
     - name: block-cidr
       action: Deny
       match:
-        pod: { name: probe }
         cidrs: ["${BLOCKED}"]
 YAML
 sleep 12  # agent re-walk ticker maps the pod cgroup + programs the verdict
