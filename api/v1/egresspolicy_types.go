@@ -22,11 +22,16 @@ type EgressPolicySpec struct {
 	// +kubebuilder:validation:Required
 	PodSelector metav1.LabelSelector `json:"podSelector"`
 
-	// DefaultAction is applied to a flow that matches no rule. Empty defaults to
-	// Allow (blocklist). It applies only to the pods selected by podSelector: on a
-	// namespaced EgressPolicy, Deny default-denies that namespace's selected pods;
-	// on a ClusterEgressPolicy it default-denies the selected pods node-wide, and
-	// only an EMPTY podSelector ({}) makes it the true node-global default-deny.
+	// DefaultAction picks the policy's posture — the verdict for a flow that matches
+	// no rule. It is OPTIONAL and defaults to Allow (blocklist mode). It is not
+	// inferred from whether rules exist, because each rule carries its own
+	// Allow/Deny action: a blocklist is Deny rules + defaultAction Allow ("allow all
+	// except these"); an allowlist is Allow rules + defaultAction Deny ("deny all
+	// except these"). Set Deny explicitly to opt into allowlist mode.
+	// It applies only to the pods selected by podSelector: on a namespaced
+	// EgressPolicy, Deny default-denies that namespace's selected pods; on a
+	// ClusterEgressPolicy it default-denies the selected pods node-wide, and only an
+	// EMPTY podSelector ({}) makes it the true node-global default-deny.
 	// +kubebuilder:validation:Enum=Allow;Deny
 	// +optional
 	DefaultAction string `json:"defaultAction,omitempty"`
@@ -59,11 +64,6 @@ type Rule struct {
 // Match is an AND across its dimensions; an empty dimension matches anything.
 // Within a slice dimension (Domains, CIDRs, Ports, Methods) the semantics are OR.
 type Match struct {
-	// Pod selects source pods. On a namespaced EgressPolicy the namespace is
-	// forced to the CR's own namespace.
-	// +optional
-	Pod PodSelector `json:"pod,omitempty"`
-
 	// Domains are DNS qname / TLS SNI / HTTP Host suffix globs: "example.com"
 	// and "*.example.com" both match example.com and any subdomain.
 	// +optional
@@ -87,20 +87,6 @@ type Match struct {
 	// PathPrefix (L7): same scope as Methods.
 	// +optional
 	PathPrefix string `json:"pathPrefix,omitempty"`
-}
-
-// PodSelector picks source pods. Namespace/Name/UID match the resolved pod
-// identity exactly; Labels match the pod's labels. On a namespaced EgressPolicy
-// the Namespace is overridden with the CR's own namespace.
-type PodSelector struct {
-	// +optional
-	Namespace string `json:"namespace,omitempty"`
-	// +optional
-	Name string `json:"name,omitempty"`
-	// +optional
-	UID string `json:"uid,omitempty"`
-	// +optional
-	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // Mutation describes an L7 edit, carried as data only for now (the deferred
@@ -177,13 +163,10 @@ func (s *EgressPolicySpec) ToPolicy() *policy.Policy {
 		pr := policy.Rule{
 			Name:   r.Name,
 			Action: policy.Action(r.Action),
+			// Match.Pod is left zero: source-pod selection comes solely from the
+			// top-level spec.podSelector, which Aggregate/Flatten folds into every
+			// rule's Match.Pod (with the namespace, for a namespaced EgressPolicy).
 			Match: policy.Match{
-				Pod: policy.PodSelector{
-					Namespace: r.Match.Pod.Namespace,
-					Name:      r.Match.Pod.Name,
-					UID:       r.Match.Pod.UID,
-					Labels:    r.Match.Pod.Labels,
-				},
 				Domains:    r.Match.Domains,
 				CIDRs:      r.Match.CIDRs,
 				Ports:      portsToUint16(r.Match.Ports),

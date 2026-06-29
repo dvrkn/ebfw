@@ -60,11 +60,16 @@ spec:
             properties:
               defaultAction:
                 description: |-
-                  DefaultAction is applied to a flow that matches no rule. Empty defaults to
-                  Allow (blocklist). It applies only to the pods selected by podSelector: on a
-                  namespaced EgressPolicy, Deny default-denies that namespace's selected pods;
-                  on a ClusterEgressPolicy it default-denies the selected pods node-wide, and
-                  only an EMPTY podSelector ({}) makes it the true node-global default-deny.
+                  DefaultAction picks the policy's posture — the verdict for a flow that matches
+                  no rule. It is OPTIONAL and defaults to Allow (blocklist mode). It is not
+                  inferred from whether rules exist, because each rule carries its own
+                  Allow/Deny action: a blocklist is Deny rules + defaultAction Allow ("allow all
+                  except these"); an allowlist is Allow rules + defaultAction Deny ("deny all
+                  except these"). Set Deny explicitly to opt into allowlist mode.
+                  It applies only to the pods selected by podSelector: on a namespaced
+                  EgressPolicy, Deny default-denies that namespace's selected pods; on a
+                  ClusterEgressPolicy it default-denies the selected pods node-wide, and only an
+                  EMPTY podSelector ({}) makes it the true node-global default-deny.
                 enum:
                 - Allow
                 - Deny
@@ -164,22 +169,6 @@ spec:
                         pathPrefix:
                           description: 'PathPrefix (L7): same scope as Methods.'
                           type: string
-                        pod:
-                          description: |-
-                            Pod selects source pods. On a namespaced EgressPolicy the namespace is
-                            forced to the CR's own namespace.
-                          properties:
-                            labels:
-                              additionalProperties:
-                                type: string
-                              type: object
-                            name:
-                              type: string
-                            namespace:
-                              type: string
-                            uid:
-                              type: string
-                          type: object
                         ports:
                           description: Ports are destination ports.
                           items:

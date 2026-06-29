@@ -1,4 +1,4 @@
-# EgressPolicy & ClusterEgressPolicy (Stage 3)
+# EgressPolicy & ClusterEgressPolicy
 
 ebfw exposes its egress policy as two Kubernetes CRDs in the group
 `ebfw.dvrkn.com/v1`:
@@ -41,6 +41,26 @@ spec:
     - { action: Allow, match: { ports: [53] } }
 ```
 
+### Choosing the posture — `spec.defaultAction`
+
+`defaultAction` is the verdict for a flow that **matches no rule**, and it picks
+the policy's posture. It is **optional** and defaults to **`Allow`**, so an empty
+or observe-only policy never breaks egress.
+
+It is **not** inferred from whether rules are present, because every rule carries
+its own `Allow`/`Deny` action. The two postures are:
+
+| Posture | Rules | `defaultAction` | Reads as |
+|---------|-------|-----------------|----------|
+| **Blocklist** (default) | `Deny` rules | `Allow` | "allow everything **except** these" |
+| **Allowlist** | `Allow` rules | `Deny` | "deny everything **except** these" |
+
+A blocklist is a few `Deny` rules expecting everything else through — defaulting
+to `Deny` just because rules exist would invert its intent and block the traffic
+the rules never mention. So to lock pods down to an allowlist you must set
+`defaultAction: Deny` **explicitly**; otherwise rules are additive denies over an
+allow-all baseline.
+
 ## How the two kinds combine
 
 The agent aggregates every policy on the node, first-match-wins, in this order
@@ -49,8 +69,7 @@ so a policy only ever affects its selected pods):
 
 1. **ClusterEgressPolicy rules** (sorted by name) — applied node-wide as written.
 2. **EgressPolicy rules** (sorted by namespace, then name) — each automatically
-   scoped to its own namespace (a namespaced policy can only affect its own pods;
-   any `match.pod.namespace` you set is overridden with the CR's namespace).
+   scoped to its own namespace (a namespaced policy can only affect its own pods).
 3. **Default-deny catch-alls** — for each policy with `defaultAction: Deny`, a
    trailing catch-all `Deny` scoped to its selected pods (namespace + podSelector
    for an EgressPolicy; podSelector node-wide for a ClusterEgressPolicy).
@@ -82,16 +101,12 @@ spec:
     matchLabels: { app: frontend }     #   (rules + defaultAction). {} = all pods in scope.
     matchExpressions:                  #   In / NotIn / Exists / DoesNotExist
       - { key: tier, operator: In, values: ["web"] }
-  defaultAction: Allow | Deny          # default when no rule matches (default Allow)
+  defaultAction: Allow | Deny          # posture when no rule matches; OPTIONAL, default Allow (blocklist)
   rules:                               # evaluated in order; first match wins
     - name: <string>                   # label for logs/metrics
       action: Allow | Deny | Modify    # required
       match:                           # AND across dimensions; empty = match-any
-        pod:                           # per-rule source pod selector (narrows this rule)
-          namespace: <string>          # (ignored for EgressPolicy — forced to the CR's ns)
-          name: <string>
-          uid: <string>
-          labels: { k: v }             # matchLabels equality against the pod's labels
+                                       # (source pods come from spec.podSelector — no per-rule pod field)
         domains: ["example.com", "*.example.com"]  # DNS qname / TLS SNI / HTTP Host suffix globs
         cidrs: ["203.0.113.0/24"]      # destination IP ranges (IPv4 enforced; IPv6 logged)
         ports: [443]                   # destination ports (1..65535)
@@ -107,11 +122,11 @@ spec:
 ### What is enforced vs logged
 
 Enforced by the kernel datapath: domain rules (via DNS→IP learning), IPv4 CIDR
-rules, IP+port pairs, the default posture, and **pod selection** — both the
-policy-level `podSelector` and per-rule `match.pod` (namespace/name/uid/labels).
-Pod selection is realized by resolving the selector to the matching pods' cgroup
-ids and programming per-cgroup map entries (a pod-only rule sets that cgroup's
-default action). Evaluated for log/metrics but **not dropped yet**: port-only
+rules, IP+port pairs, the default posture, and **pod selection** via the
+policy-level `spec.podSelector`. Pod selection is realized by resolving the
+selector to the matching pods' cgroup ids and programming per-cgroup map entries
+(a subject-scoped default-deny sets that cgroup's default action). Evaluated for
+log/metrics but **not dropped yet**: port-only
 rules (no IP), IPv6 CIDRs, CIDR+port combinations, L7 (`methods`/`pathPrefix`),
 and `Modify`.
 
