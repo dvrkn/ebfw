@@ -1,0 +1,41 @@
+# GitHub Pages (Jekyll) config for the ebfw docs site.
+# Pages source: branch `main`, folder `/docs`. Builds automatically — no Action.
+title: ebfw
+tagline: eBPF egress firewall for Kubernetes
+description: >-
+  See exactly what every pod talks to — domains, paths, IPs — then allow or deny
+  it. Attributed per pod. Enforced in the kernel.
+
+# Project page lives at https://dvrkn.github.io/ebfw/. If you add a custom domain
+# (CNAME), set baseurl to "" .
+baseurl: "/ebfw"
+url: "https://dvrkn.github.io"
+github_repo: "https://github.com/dvrkn/ebfw"
+
+# GitHub-Pages-safe plugins (auto-enabled on Pages; listed for local builds).
+plugins:
+  - jekyll-relative-links      # rewrites [x](foo.md) links to their built URLs
+  - jekyll-optional-front-matter  # render the existing .md docs (no front matter)
+relative_links:
+  enabled: true
+  collections: false
+optional_front_matter:
+  remove_originals: true       # render docs to .html; don't also ship the raw .md
+
+# Apply the chrome to every page, and set per-doc <title>s WITHOUT editing the
+# markdown source (keeps the docs clean on the GitHub repo view too).
+defaults:
+  - scope: { path: "" }
+    values: { layout: default }
+  - scope: { path: "install.md" }
+    values: { title: "Install & run" }
+  - scope: { path: "configuration.md" }
+    values: { title: "Configuration" }
+  - scope: { path: "egresspolicy.md" }
+    values: { title: "Egress policies" }
+
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor
