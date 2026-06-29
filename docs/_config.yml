@@ -33,6 +33,8 @@ defaults:
     values: { title: "Configuration" }
   - scope: { path: "egresspolicy.md" }
     values: { title: "Egress policies" }
+  - scope: { path: "comparison.md" }
+    values: { title: "vs Cilium" }
 
 exclude:
   - README.md

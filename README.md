@@ -102,6 +102,22 @@ kubectl apply -f config/samples/ebfw_v1_egresspolicy.yaml
 
 Full guide → [**docs/install.md**](docs/install.md).
 
+## How is this different from Cilium?
+
+**Cilium is a CNI — it owns your cluster's network. ebfw rides alongside whatever
+you already run.** It attaches at the node's root cgroup, so you can drop the
+DaemonSet on any node (any CNI, or no Kubernetes at all), watch egress in `log`
+mode, and pull it back out with zero effect on connectivity — it never touches the
+dataplane.
+
+The headline difference: ebfw reads **HTTPS request paths and headers from an
+`SSL_write` uprobe — before encryption, with no proxy and no TLS MITM.** Cilium
+needs a terminating Envoy and injected certs to see the same thing.
+
+ebfw is the lightweight egress firewall + per-pod L7 *visibility* layer; Cilium is
+the full networking platform (and does L7 *enforcement* today, which ebfw doesn't
+yet). Full feature-by-feature breakdown → [**docs/comparison.md**](docs/comparison.md).
+
 ### Container hosts (without Kubernetes)
 
 ebfw isn't tied to Kubernetes. The same agent — as a privileged container or a
