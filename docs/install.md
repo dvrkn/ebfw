@@ -17,7 +17,7 @@ make test              # unit tests (TLS SNI parser); runs anywhere, no eBPF
 
 ## Deploy
 
-`ebfw` is installed with the Helm chart in [`helm/ebfw`](../helm/ebfw) — CRDs, the
+`ebfw` is installed with the Helm chart in [`helm/ebfw`](https://github.com/dvrkn/ebfw/tree/main/helm/ebfw) — CRDs, the
 operator, and the per-node agent DaemonSet.
 
 ```bash

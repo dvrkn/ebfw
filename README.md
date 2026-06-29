@@ -8,6 +8,7 @@
 
 *See exactly what every pod talks to — domains, paths, IPs — then allow or deny it.<br/>Attributed per pod. Enforced in the kernel.*
 
+[![Website](https://img.shields.io/badge/docs-dvrkn.github.io%2Febfw-F2A93B?logo=githubpages&logoColor=white)](https://dvrkn.github.io/ebfw/)
 [![e2e](https://github.com/dvrkn/ebfw/actions/workflows/e2e.yml/badge.svg)](https://github.com/dvrkn/ebfw/actions/workflows/e2e.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dvrkn/ebfw)](https://goreportcard.com/report/github.com/dvrkn/ebfw)
 [![Go](https://img.shields.io/github/go-mod/go-version/dvrkn/ebfw?logo=go&logoColor=white&color=00ADD8)](go.mod)

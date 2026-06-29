@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if page.url == "/" %}{{ site.title }} — {{ site.tagline }}{% else %}{{ page.title | default: site.title }} · {{ site.title }}{% endif %}</title>
+  <meta name="description" content="{{ page.description | default: site.description | strip_newlines }}">
+  <link rel="icon" type="image/png" href="{{ '/assets/logo.png' | relative_url }}">
+  <meta property="og:title" content="{{ page.title | default: site.title }}">
+  <meta property="og:description" content="{{ site.description | strip_newlines }}">
+  <meta property="og:image" content="{{ '/assets/logo.png' | absolute_url }}">
+  <meta name="theme-color" content="#0c0e13">
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+</head>
+<body>
+  <header class="nav">
+    <div class="nav__inner">
+      <a class="nav__brand" href="{{ '/' | relative_url }}">
+        <img src="{{ '/assets/logo.png' | relative_url }}" alt="" class="nav__logo" width="28" height="28">
+        <span>ebfw</span>
+      </a>
+      <input type="checkbox" id="nav-toggle" class="nav__toggle" hidden>
+      <label for="nav-toggle" class="nav__burger" aria-label="Menu"><span></span><span></span><span></span></label>
+      <nav class="nav__links">
+        <a href="{{ '/install.html' | relative_url }}">Install</a>
+        <a href="{{ '/configuration.html' | relative_url }}">Configuration</a>
+        <a href="{{ '/egresspolicy.html' | relative_url }}">Egress policies</a>
+        <a href="{{ site.github_repo }}/blob/main/ROADMAP.md">Roadmap</a>
+        <a class="nav__gh" href="{{ site.github_repo }}">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </div>
+  </header>
+
+  {{ content }}
+
+  <footer class="footer">
+    <div class="footer__inner">
+      <div class="footer__brand">
+        <img src="{{ '/assets/logo.png' | relative_url }}" alt="" width="32" height="32">
+        <div>
+          <strong>ebfw</strong>
+          <span>{{ site.tagline }}</span>
+        </div>
+      </div>
+      <nav class="footer__links">
+        <a href="{{ '/install.html' | relative_url }}">Install</a>
+        <a href="{{ '/configuration.html' | relative_url }}">Configuration</a>
+        <a href="{{ '/egresspolicy.html' | relative_url }}">Egress policies</a>
+        <a href="{{ site.github_repo }}/blob/main/ROADMAP.md">Roadmap</a>
+        <a href="{{ site.github_repo }}">GitHub</a>
+      </nav>
+      <p class="footer__legal"><a href="{{ site.github_repo }}/blob/main/LICENSE">MIT</a> © dvrkn</p>
+    </div>
+  </footer>
+</body>
+</html>
