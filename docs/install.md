@@ -53,6 +53,85 @@ helm install ebfw ./helm/ebfw -n ebfw --create-namespace \
 See [configuration.md](configuration.md) for every chart value and agent env var,
 and [egresspolicy.md](egresspolicy.md) for the policy CRD reference.
 
+## Run standalone (container hosts, no Kubernetes)
+
+`ebfw` is Kubernetes-native, but it isn't tied to Kubernetes: the agent is a single
+self-contained binary that watches and enforces egress for **every container on a
+plain container host** (Docker / containerd) via the same root-cgroup eBPF hooks —
+no orchestrator, API server, CRDs, or operator. Policy comes from a **YAML file**
+instead of the CRDs. This is the right fit for a Docker/containerd VM, an edge
+node, or trying enforcement out before wiring up the chart.
+
+You can run ebfw either as the published agent image (the container-native way) or
+as a host binary.
+
+**As a container** — the agent image is just the static binary, so run it
+privileged with host networking, host PID (to find each container's `libssl`), and
+the cgroup + policy mounts:
+
+```bash
+docker run -d --name ebfw \
+  --privileged --network host --pid host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  -v "$PWD/config.yaml:/etc/ebfw/config.yaml:ro" \
+  -v "$PWD/policy.yaml:/etc/ebfw/policy.yaml:ro" \
+  -e EBFW_CONFIG=/etc/ebfw/config.yaml \
+  -e EBFW_ENFORCE_MODE=enforce -e EBFW_POLICY=/etc/ebfw/policy.yaml \
+  ghcr.io/dvrkn/ebfw:latest
+```
+
+**As a host binary** — build it (no clang needed; compiled in Docker) and run it
+as root with a filter config and, optionally, a policy file:
+
+```bash
+docker build --target bin --output type=local,dest=out .   # -> out/ebfw
+                                                            # (or `make build` on Linux w/ clang + libbpf-dev)
+
+# Visibility only — print every container's (and host process's) egress:
+sudo EBFW_CONFIG=config.yaml ./out/ebfw
+
+# With enforcement from a YAML policy (file is the default source):
+sudo EBFW_CONFIG=config.yaml \
+  EBFW_ENFORCE_MODE=enforce \
+  EBFW_POLICY=policy.yaml \
+  ./out/ebfw
+```
+
+- **Policy source is the file by default.** `EBFW_POLICY_SOURCE=file` (the default
+  off-cluster) reads `EBFW_POLICY`; see
+  [Policy file format](configuration.md#policy-file-format) for the schema and
+  [`examples/policy.yaml`](https://github.com/dvrkn/ebfw/blob/main/examples/policy.yaml)
+  for a worked example. The file is **hot-reloaded** on change — a bad reload is
+  logged and ignored, keeping the last good policy. No `crd` source, operator, or
+  RBAC is involved.
+- **Capabilities.** Run as root, or grant `CAP_BPF, CAP_PERFMON, CAP_NET_ADMIN,
+  CAP_SYS_ADMIN` (kernel-dependent) and (for HTTPS path capture) read access to
+  other processes' `/proc/<pid>/maps` to locate their `libssl`.
+- **Enforcement is host-wide.** The hooks attach at the host's root cgroup, so a
+  `defaultAction: Deny` policy cuts off **the whole host** — every container *and*
+  the host itself (don't lock yourself out of SSH / package mirrors). On a container
+  host, prefer a **blocklist** (`defaultAction: Allow` + `Deny` rules), and always
+  keep `udp:53` reachable so DNS resolves.
+- **Attribution degrades to PID/destination.** Pod attribution is built on the
+  Kubernetes cgroup layout (`kubepods/…`) plus the Pods informer, so on a plain
+  Docker/containerd host neither applies: there's no `namespace/name`, and
+  `podSelector` / `match.pod` rules program nothing (they need pod labels). Events
+  still show the connecting **PID and command** (HTTPS via the uprobe) and the
+  **destination** (domain / IP / port), and **node-wide rules** (IP / CIDR / domain
+  / port, no pod selector) see and enforce against every container's traffic
+  normally — the visibility and the datapath are container-agnostic.
+
+Validate a policy offline first — no kernel, no root:
+
+```bash
+./out/ebfw policy test --policy policy.yaml \
+  --flow 'dst=203.0.113.5 port=443 domain=api.example.com' \
+  --flow 'domain=evil.com port=443'
+```
+
+Everything else (env vars, filter config, metrics) is identical to the in-cluster
+agent — see [configuration.md](configuration.md).
+
 ## Images
 
 Published multi-arch by CI on `main`/tags after the test jobs pass:

@@ -102,6 +102,14 @@ kubectl apply -f config/samples/ebfw_v1_egresspolicy.yaml
 
 Full guide → [**docs/install.md**](docs/install.md).
 
+### Container hosts (without Kubernetes)
+
+ebfw isn't tied to Kubernetes. The same agent — as a privileged container or a
+single host binary — watches and enforces egress for **every container on a plain
+Docker / containerd host**, driven by a YAML policy file instead of the CRDs (same
+visibility, same node-wide enforcement, no API server or operator). See
+[**Run standalone**](docs/install.md#run-standalone-container-hosts-no-kubernetes).
+
 ## License
 
 [MIT](LICENSE) © dvrkn.

@@ -79,6 +79,54 @@ ebfw policy test --policy examples/policy.yaml \
 MITM) is a deferred, opt-in feature; the cgroup/connect datapath treats `Modify`
 as `Allow`.
 
+### Policy file format
+
+The `EBFW_POLICY` file is the policy model written at the **top level** — there is
+no `apiVersion` / `kind` / `metadata` envelope (that is CRD-only). The same
+[`examples/policy.yaml`](https://github.com/dvrkn/ebfw/blob/main/examples/policy.yaml)
+fixture is what `policy test` uses.
+
+```yaml
+defaultAction: Deny             # posture when a flow matches no rule; OPTIONAL,
+                                #   default Allow (blocklist). Deny = allowlist.
+
+podSelector:                    # OPTIONAL: scope the WHOLE file to these pods
+  matchLabels: { app: web }     #   (label-based; needs the Pods informer, so it
+                                #    no-ops off-cluster — see Pod attribution)
+
+rules:                          # evaluated in order; FIRST match wins
+  - name: allow-github          # label for logs/metrics
+    action: Allow               # Allow | Deny | Modify
+    match:                      # AND across dimensions; an absent one matches any,
+                                #   a list is OR within (any domain / any port)
+      pod:                      # per-rule source selector (file source only)
+        namespace: payments
+        labels: { team: platform }
+        matchExpressions:       # In / NotIn / Exists / DoesNotExist
+          - { key: tier, operator: In, values: ["web"] }
+      domains: ["github.com", "*.githubusercontent.com"]  # DNS qname / SNI / Host globs
+      cidrs: ["203.0.113.0/24"] # destination IP ranges (IPv4 enforced; IPv6 logged)
+      ports: [443]              # destination ports, 1..65535
+      methods: ["GET"]          # L7 — evaluated for log/metrics, not dropped yet
+      pathPrefix: "/api"        # L7 — evaluated for log/metrics, not dropped yet
+    mutations:                  # required iff action: Modify (modeled, not enforced)
+      - { type: SetHeader, header: X-Egress-Checked, value: ebfw }
+      #   type: SetHeader | AddHeader | RemoveHeader | RewritePath
+      #   header/value for the header types; pathReplace for RewritePath
+```
+
+It is the **same rule/match model** as the CRD `spec:` (see
+[egresspolicy.md](egresspolicy.md) for full field semantics and the
+enforced-vs-logged breakdown), with two differences:
+
+1. **No envelope** — fields sit at the document root, not under `spec:`.
+2. **Per-rule `match.pod`** — the file source lets each rule carry its own source
+   pod selector (namespace / name / uid / labels / matchExpressions). The CRD has
+   no per-rule pod field; it uses the single top-level `spec.podSelector` instead.
+
+`defaultAction` and `podSelector` are optional in the file source (the pure model
+is permissive); on the CRDs `podSelector` is required by the schema.
+
 ## Pod attribution
 
 When the agent runs in-cluster it watches Pods on its own node (a `spec.nodeName`
