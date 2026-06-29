@@ -14,9 +14,10 @@ operator:
   enabled: true
   image:
     repository: ghcr.io/dvrkn/ebfw-operator
-    # tag defaults to .Chart.appVersion when empty.
+    # tag empty -> "latest" (CI publishes :latest on main; pin a released :X.Y.Z for production).
     tag: ""
-    pullPolicy: IfNotPresent
+    # pullPolicy empty -> Always for :latest, IfNotPresent for a pinned tag.
+    pullPolicy: ""
   replicas: 1
   # leaderElect lets you run >1 replica safely (only one reconciles).
   leaderElect: true
@@ -36,9 +37,10 @@ agent:
   enabled: true
   image:
     repository: ghcr.io/dvrkn/ebfw
-    # tag defaults to .Chart.appVersion when empty.
+    # tag empty -> "latest" (CI publishes :latest on main; pin a released :X.Y.Z for production).
     tag: ""
-    pullPolicy: IfNotPresent
+    # pullPolicy empty -> Always for :latest, IfNotPresent for a pinned tag.
+    pullPolicy: ""
   # enforceMode: off (observe-only) | log (annotate, no drops) | enforce (drop).
   enforceMode: "off"
   # policySource: crd (watch the CRDs — the default for Helm installs) | file.
