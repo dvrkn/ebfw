@@ -93,7 +93,7 @@ spec:
       containers:
         - name: ebfw
           image: {{ include "ebfw.agent.image" . | quote }}
-          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          imagePullPolicy: {{ include "ebfw.agent.pullPolicy" . }}
           securityContext:
             privileged: true
           env:
