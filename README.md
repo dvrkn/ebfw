@@ -31,7 +31,7 @@ encryption. Every event is attributed to the originating pod (`namespace/name`).
 The same in-kernel hooks then **allow or deny egress** per pod by
 domain / IP / CIDR / port, driven by Kubernetes-native `EgressPolicy` CRDs. It
 also sees HTTP paths and headers and lets policy match on method and path
-(evaluated today; in-kernel L7 enforcement is on the roadmap).
+(evaluated today; L7 enforcement is on the roadmap).
 
 ## How it works
 

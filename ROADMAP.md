@@ -56,11 +56,15 @@ Broaden coverage and smooth the rough edges now that the happy path is proven.
 ### Datapath & hardening
 
 - `connect6` / IPv6 enforcement and IPv6 extension-header parsing.
-- An in-kernel TLS-SNI / HTTP-Host drop backstop (limited by ECH).
+- **L7 (method / path) policy enforcement.** The `methods` and `pathPrefix` rule
+  dimensions are accepted and evaluated for `log`/metrics today, but not yet
+  dropped. Enforce them via two paths: an in-kernel TLS-SNI / HTTP-Host drop
+  backstop for connection-level domain denies (limited by ECH), and a terminating
+  L7 proxy + TLS MITM for full method / path / header semantics.
+- Request **modify** (header injection / path rewrite — modeled in the policy now;
+  shares the terminating L7 proxy above).
 - Pinned maps + an external map-programming controller (the per-node agent programs
   its own maps for now).
-- Request **modify** (header injection / path rewrite — modeled in the policy now
-  but needs a terminating L7 proxy + TLS MITM to enforce).
 - TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, cgroup-v1 fallback,
   request-body inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI,
   HA, and scale tests.
