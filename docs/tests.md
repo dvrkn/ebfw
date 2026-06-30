@@ -45,7 +45,19 @@ path:
   enforcing (asserted at both the operator status and the agent datapath);
 - **policy merge** — multiple policies over one pod merge by the union of their
   denies, a `ClusterEgressPolicy` and a namespaced `EgressPolicy` stack on the same
-  pod, and a longer-prefix Allow overrides a broader Deny (most-specific match).
+  pod, and a longer-prefix Allow overrides a broader Deny (most-specific match);
+- **cross-namespace isolation** — a namespaced deny stays in its own namespace and
+  does not leak into another;
+- **domain deny via CRD** — a `domains:` rule blocks the resolved IPs through the
+  DNS→IP learner;
+- **deferred dimensions** — port-only / IPv6 / L7 (method, path) rules are evaluated
+  for log/metrics but not dropped at the cgroup datapath (logged-not-dropped);
+- **node-wide lockdown** — a podSelector-less `ClusterEgressPolicy`
+  `defaultAction: Deny` flips the global default to Deny; an internal-CIDR + `udp:53`
+  allowlist keeps DNS and the API server up while external egress is denied, and
+  deleting it restores egress;
+- **log mode via CRD** — with `enforceMode=log`, a CRD deny annotates the verdict on
+  the event without dropping the connection.
 
 ## CI
 

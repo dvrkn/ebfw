@@ -16,6 +16,10 @@
 #   - policy merge: multiple policies over ONE pod merge by union of their denies,
 #     cluster + namespaced policies stack on the same pod, and a longer-prefix
 #     Allow overrides a broader Deny (most-specific match)
+#   - cross-namespace isolation (a namespaced deny stays in its namespace)
+#   - domain deny via CRD (DNS->IP learning), deferred dims (port-only / IPv6 / L7)
+#     logged-not-dropped, a node-wide cluster default-deny that keeps DNS+API up,
+#     and log mode via CRD (annotate the verdict, no drop)
 #
 # Builds both images via the repo Dockerfiles (no local Go/clang needed).
 # Requires: Linux, docker, k3d, kubectl, curl, jq, helm.
@@ -99,6 +103,11 @@ accepted() { kubectl get "$1" "$2" ${3:+-n "$3"} -o jsonpath='{.status.condition
 # retry_ok <attempts> <cmd...> — succeeds if any attempt exits 0. Domain-allow
 # rules depend on DNS→IP learning, which races the first connect; retry smooths it.
 retry_ok() { local n="$1"; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 3; done; return 1; }
+
+# agent_pod prints the agent pod name. Use it for `kubectl logs` instead of a label
+# selector: `kubectl logs -l <sel>` silently defaults --tail to 10 lines, which a
+# busy JSON-output agent buries instantly; a named pod honors --since fully.
+agent_pod() { kubectl -n "$NS" get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
 
 # reach <ns> <pod> <ip> — exit 0 if the pod can open a TLS connection to the IP
 # (egress allowed), nonzero if it is dropped/EPERM'd. A fresh connection each call,
@@ -438,6 +447,221 @@ m_rest=0; reach merge mp "$MERGE_A_IP2" || m_rest=$?  # 1.1.1.3 still inside the
 [ "$m_hole" -eq 0 ] && echo "PASS  merge/mp reaches ${MERGE_A_IP} (/32 Allow overrides the /24 Deny)"          || { echo "FAIL  longer-prefix Allow did not win over the broader Deny"; fail=1; }
 [ "$m_rest" -ne 0 ] && echo "PASS  merge/mp still denied to ${MERGE_A_IP2} (rest of ${MERGE_A_CIDR}, rc=$m_rest)" || { echo "FAIL  the /32 Allow leaked to the rest of the /24"; fail=1; }
 kubectl delete egresspolicy m-deny-a m-deny-b m-allow-host -n merge >/dev/null 2>&1 || true
+
+# ── Aggregation, dimensions & modes (Tests 13-17). External probe targets: 1.1.1.1
+# (allowlisted/control) and 8.8.8.8 (the "is external egress allowed?" probe — note
+# 8.8.8.0/24 is blocked by none of the prior tests). example.com exercises the DNS
+# learner. The node-wide lockdown (Test 16) runs after the simpler enforce tests so
+# a mis-scoped global deny can't mask them; log mode (Test 17) is last. ──
+EXT_ALLOW_CIDR="${EXT_ALLOW_CIDR:-1.1.1.0/24}"; EXT_ALLOW_IP="${EXT_ALLOW_IP:-1.1.1.1}"
+EXT_DENY_IP="${EXT_DENY_IP:-8.8.8.8}"
+DENY_DOMAIN="${DENY_DOMAIN:-example.com}"
+
+# ── Test 13: namespaced EgressPolicies are isolated to their own namespace — a
+# deny in namespace A must not affect pods in namespace B, and vice versa. ──
+note "Test 13: cross-namespace isolation (a namespaced deny stays in its namespace)"
+kubectl create namespace nsa >/dev/null 2>&1 || true
+kubectl create namespace nsb >/dev/null 2>&1 || true
+kubectl -n nsa run pa --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n nsb run pb --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n nsa wait --for=condition=Ready pod/pa --timeout=120s >/dev/null || { echo "ERROR: pa not ready"; fail=1; }
+kubectl -n nsb wait --for=condition=Ready pod/pb --timeout=120s >/dev/null || { echo "ERROR: pb not ready"; fail=1; }
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: a-deny, namespace: nsa }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-cf
+      action: Deny
+      match: { cidrs: ["${EXT_ALLOW_CIDR}"] }   # nsa denies 1.1.1.0/24
+YAML
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: b-deny, namespace: nsb }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-goog
+      action: Deny
+      match: { cidrs: ["8.8.8.0/24"] }           # nsb denies 8.8.8.0/24
+YAML
+sleep 12
+pa_self=0; reach nsa pa "$EXT_ALLOW_IP" || pa_self=$?   # pa denied its OWN ns rule (1.1.1.1)
+pa_other=1; reach nsa pa "$EXT_DENY_IP" && pa_other=0   # pa unaffected by nsb's rule (8.8.8.8 open)
+pb_self=0; reach nsb pb "$EXT_DENY_IP" || pb_self=$?    # pb denied its OWN ns rule (8.8.8.8)
+pb_other=1; reach nsb pb "$EXT_ALLOW_IP" && pb_other=0  # pb unaffected by nsa's rule (1.1.1.1 open)
+[ "$pa_self" -ne 0 ]  && echo "PASS  nsa/pa denied to ${EXT_ALLOW_IP} (its own a-deny, rc=$pa_self)"     || { echo "FAIL  nsa policy not enforced on its pod"; fail=1; }
+[ "$pa_other" -eq 0 ] && echo "PASS  nsa/pa reaches ${EXT_DENY_IP} (nsb's b-deny does NOT leak into nsa)" || { echo "FAIL  nsb policy leaked into nsa"; fail=1; }
+[ "$pb_self" -ne 0 ]  && echo "PASS  nsb/pb denied to ${EXT_DENY_IP} (its own b-deny, rc=$pb_self)"       || { echo "FAIL  nsb policy not enforced on its pod"; fail=1; }
+[ "$pb_other" -eq 0 ] && echo "PASS  nsb/pb reaches ${EXT_ALLOW_IP} (nsa's a-deny does NOT leak into nsb)" || { echo "FAIL  nsa policy leaked into nsb"; fail=1; }
+kubectl delete egresspolicy a-deny -n nsa >/dev/null 2>&1 || true
+kubectl delete egresspolicy b-deny -n nsb >/dev/null 2>&1 || true
+
+# ── Test 14: a domain Deny via CRD — the agent learns the domain's A records from
+# DNS answers and programs the resolved IPs (LRU + TTL). The first requests prime
+# the learner (their connect races the map write); a primed request is then
+# dropped while an unrelated dest stays reachable. ──
+note "Test 14: domain deny via CRD (${DENY_DOMAIN}) using DNS->IP learning"
+kubectl create namespace dom >/dev/null 2>&1 || true
+kubectl -n dom run dp --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n dom wait --for=condition=Ready pod/dp --timeout=120s >/dev/null || { echo "ERROR: dp not ready"; fail=1; }
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: dom-deny, namespace: dom }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-domain
+      action: Deny
+      match: { domains: ["${DENY_DOMAIN}", "*.${DENY_DOMAIN}"] }
+YAML
+sleep 12
+for _ in 1 2 3; do kubectl -n dom exec dp -- curl -4 -sk -o /dev/null --max-time 6 "https://${DENY_DOMAIN}/" >/dev/null 2>&1; sleep 2; done  # prime the learner
+dom_denied=0; kubectl -n dom exec dp -- curl -4 -sk -o /dev/null --max-time 6 "https://${DENY_DOMAIN}/" || dom_denied=$?
+dom_other=1; reach dom dp "$EXT_DENY_IP" && dom_other=0   # an IP not covered by the domain rule stays open
+[ "$dom_denied" -ne 0 ] && echo "PASS  dom/dp denied to ${DENY_DOMAIN} via DNS-learned IPs (rc=$dom_denied)" || { echo "FAIL  CRD domain deny not enforced"; fail=1; }
+[ "$dom_other" -eq 0 ]  && echo "PASS  dom/dp still reaches ${EXT_DENY_IP} (domain rule scoped to the domain)" || { echo "FAIL  domain deny over-blocked"; fail=1; }
+kubectl delete egresspolicy dom-deny -n dom >/dev/null 2>&1 || true
+
+# ── Test 15: deferred dimensions are evaluated for log/metrics but NOT dropped at
+# the cgroup datapath. A port-only deny (ports:[443]) plus an IPv6 CIDR and an L7
+# path rule are all deferred — so dp's HTTPS egress to ${EXT_DENY_IP} (port 443)
+# still succeeds, and the agent logs the deferred-dimension count. (Reuses dom/dp.) ──
+note "Test 15: deferred dims (port-only / IPv6 / L7) are logged-not-dropped"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: deferred-dims, namespace: dom }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-port-only
+      action: Deny
+      match: { ports: [443] }
+    - name: deny-ipv6
+      action: Deny
+      match: { cidrs: ["2606:4700::/32"] }
+    - name: deny-l7-path
+      action: Deny
+      match: { methods: ["GET"], pathPrefix: "/blocked" }
+YAML
+sleep 12
+df_open=1; reach dom dp "$EXT_DENY_IP" && df_open=0   # :443 deny is deferred -> NOT dropped
+# the deferred-dimension log fires on every apply + 10s re-walk tick; query the
+# NAMED pod with --since (a label selector caps --tail at 10 lines and buries it
+# under JSON event spam) and retry across a couple of ticks.
+df_log=1; for _ in $(seq 1 8); do kubectl -n "$NS" logs "$(agent_pod)" --since=90s 2>/dev/null | grep -q "not enforceable" && { df_log=0; break; }; sleep 3; done
+[ "$df_open" -eq 0 ] && echo "PASS  deferred: port-only :443 deny did NOT drop HTTPS to ${EXT_DENY_IP}" || { echo "FAIL  a deferred (port-only) dim was dropped"; fail=1; }
+[ "$df_log" -eq 0 ]  && echo "PASS  deferred: agent logged the un-enforceable dimensions"               || { echo "FAIL  agent did not log deferred dimensions"; fail=1; }
+kubectl delete egresspolicy deferred-dims -n dom >/dev/null 2>&1 || true
+
+# ── Test 16: a node-wide ClusterEgressPolicy defaultAction:Deny (no podSelector)
+# flips the GLOBAL default to Deny — the cluster-admin lockdown. An allowlist of the
+# internal/loopback CIDRs (programmed node-global, so they apply to every cgroup)
+# plus udp:53 (always allowed in-kernel) keeps DNS and the in-cluster control plane
+# up while unlisted EXTERNAL egress is denied.
+#
+# A true node-global default-deny breaks `kubectl exec` itself (it disrupts the
+# apiserver->kubelet:10250 channel), so we CANNOT exec-probe during the lockdown.
+# Instead a detached in-pod prober (started before the lockdown, independent of the
+# exec channel) records reachability to a file every 2s; after the lockdown is
+# lifted we read it back and assert on the rows stamped DURING the lockdown window.
+# The script runs on the k3d host, so its `date +%s` matches the pod's clock. ──
+note "Test 16: node-wide cluster defaultAction:Deny keeps DNS + internal up, denies external"
+kubectl create namespace lockdown >/dev/null 2>&1 || true
+kubectl -n lockdown run ld --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n lockdown wait --for=condition=Ready pod/ld --timeout=120s >/dev/null || { echo "ERROR: ld not ready"; fail=1; }
+# in-pod prober: timestamp + reachability of the allowlisted IP, the denied IP, DNS.
+prober="$(mktemp)"
+cat > "$prober" <<PROBE
+while true; do
+  t=\$(date +%s)
+  curl -4sk -o /dev/null -m4 https://${EXT_ALLOW_IP}/ && a=OK || a=FAIL
+  curl -4sk -o /dev/null -m4 https://${EXT_DENY_IP}/  && d=OK || d=FAIL
+  nslookup ${DENY_DOMAIN} >/dev/null 2>&1 && n=OK || n=FAIL
+  echo "\$t allow=\$a deny=\$d dns=\$n" >> /probe.log
+  sleep 2
+done
+PROBE
+kubectl -n lockdown cp "$prober" ld:/probe.sh >/dev/null 2>&1
+kubectl -n lockdown exec ld -- sh -c 'nohup sh /probe.sh >/dev/null 2>&1 & echo started' >/dev/null
+sleep 5  # a few baseline rows (egress still open)
+t_apply=$(date +%s)
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: ClusterEgressPolicy
+metadata: { name: node-lockdown }
+spec:
+  podSelector: {}            # no podSelector -> flips the node-global default
+  defaultAction: Deny
+  rules:
+    - name: allow-internal
+      action: Allow
+      match: { cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"] }
+    - name: allow-ext
+      action: Allow
+      match: { cidrs: ["${EXT_ALLOW_CIDR}"] }
+YAML
+sleep 28   # prober keeps recording while the lockdown is active (exec is unreliable now)
+t_end=$(date +%s)
+api_ok=1; kubectl get nodes >/dev/null 2>&1 && api_ok=0   # host->apiserver path (not exec) stays up
+lk_ok=""; for _ in $(seq 1 20); do [ "$(accepted clusteregresspolicy node-lockdown)" = "True" ] && { lk_ok=1; break; }; sleep 1; done
+kubectl delete clusteregresspolicy node-lockdown >/dev/null 2>&1 || true
+# wait for egress + the (lockdown-disrupted) exec channel to recover, then read the log
+plog=""; for _ in $(seq 1 20); do plog="$(kubectl -n lockdown exec ld -- cat /probe.log 2>/dev/null)"; [ -n "$plog" ] && kubectl -n lockdown exec ld -- sh -c 'true' 2>/dev/null && break; sleep 3; done
+kubectl -n lockdown exec ld -- pkill -f /probe.sh >/dev/null 2>&1 || true
+rm -f "$prober"
+# rows recorded strictly DURING the lockdown window [t_apply+5 .. t_end]
+window="$(printf '%s\n' "$plog" | awk -v a=$((t_apply+10)) -v b="$t_end" '$1>=a && $1<=b')"
+echo "# Test 16 lockdown-window probe rows:"; printf '%s\n' "$window" | sed 's/^/#   /'
+ld_dns=1;   printf '%s\n' "$window" | grep -q "dns=OK"    && ld_dns=0      # DNS up under lockdown
+ld_allow=1; printf '%s\n' "$window" | grep -q "allow=OK"  && ld_allow=0    # allowlisted external reachable
+ld_deny=1;  printf '%s\n' "$window" | grep -q "deny=FAIL" && ld_deny=0     # denied external blocked at least once
+ld_leak=0;  printf '%s\n' "$window" | grep -q "deny=OK"   && ld_leak=1     # ...and NEVER reachable (no leak)
+[ -n "$window" ]      && echo "PASS  lockdown: in-pod prober captured the lockdown window (exec recovered after delete)" || { echo "FAIL  no probe rows in the lockdown window"; fail=1; }
+[ "$ld_dns" -eq 0 ]   && echo "PASS  lockdown: DNS still resolves under global default-deny"               || { echo "FAIL  global default-deny broke DNS"; fail=1; }
+[ "$api_ok" -eq 0 ]   && echo "PASS  lockdown: API server still reachable (host kubectl works)"            || { echo "FAIL  global default-deny cut off the API server"; fail=1; }
+[ -n "$lk_ok" ]       && echo "PASS  lockdown: operator Accepted the lockdown policy"                      || { echo "FAIL  operator did not Accept the lockdown policy"; fail=1; }
+[ "$ld_allow" -eq 0 ] && echo "PASS  lockdown: allowlisted external ${EXT_ALLOW_IP} reachable"             || { echo "FAIL  allowlisted external blocked under lockdown"; fail=1; }
+{ [ "$ld_deny" -eq 0 ] && [ "$ld_leak" -eq 0 ]; } && echo "PASS  lockdown: unlisted external ${EXT_DENY_IP} consistently denied" || { echo "FAIL  global default-deny did not deny unlisted external"; fail=1; }
+
+# ── Test 17: log mode via CRD — flip the agent to enforceMode=log, then a CRD deny
+# is ANNOTATED on the event but the connection is NOT dropped. Runs last because it
+# changes the agent mode cluster-wide (no flip back needed). ──
+note "Test 17: log mode via CRD annotates the verdict without dropping"
+helm upgrade ebfw "$ROOT/helm/ebfw" --namespace "$NS" --reuse-values --set agent.enforceMode=log >/dev/null \
+  || { echo "FAIL  helm upgrade to log mode failed"; fail=1; }
+kubectl -n "$NS" rollout restart ds/ebfw-agent >/dev/null
+kubectl -n "$NS" rollout status ds/ebfw-agent --timeout=120s >/dev/null || { echo "ERROR: agent not ready after upgrade"; fail=1; }
+for _ in $(seq 1 40); do
+  kubectl -n "$NS" logs -l app.kubernetes.io/component=agent --tail=200 2>/dev/null | grep -q "watching EgressPolicy" && break
+  sleep 1
+done
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: log-deny, namespace: lockdown }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: log-block
+      action: Deny
+      match: { cidrs: ["8.8.8.0/24"] }
+YAML
+sleep 6
+log_ok=1; reach lockdown ld "$EXT_DENY_IP" && log_ok=0   # log mode: NOT dropped -> connection succeeds
+[ "$log_ok" -eq 0 ] && echo "PASS  log mode: denied flow to ${EXT_DENY_IP} NOT dropped (connection succeeded)" || { echo "FAIL  log mode dropped the connection"; fail=1; }
+assert_event "log mode: verdict annotated action=Deny" ".kind==\"connect\" and (.action|ascii_downcase)==\"deny\" and (.dst|startswith(\"8.8.8\"))"
+kubectl delete egresspolicy log-deny -n lockdown >/dev/null 2>&1 || true
 
 echo "# ============================="
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi

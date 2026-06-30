@@ -6,14 +6,11 @@ current automated-test coverage lives in [`docs/tests.md`](docs/tests.md).
 
 ## Operator hardening
 
-Broaden coverage and smooth the rough edges now that the happy path is proven.
+Smooth the rough edges now that the happy path and the full e2e matrix are proven
+(lifecycle, aggregation/merge, cross-namespace isolation, CRD domain-deny, node-wide
+lockdown, log mode, and deferred-dimension negative checks — see
+[`docs/tests.md`](docs/tests.md)).
 
-- **e2e coverage:** aggregation/posture cases not yet exercised — a node-wide
-  cluster `defaultAction: Deny` allowlist that keeps DNS and the API server
-  reachable, and explicit cross-namespace isolation (policies in different
-  namespaces not leaking into each other). More dimensions: domain **deny** via CRD,
-  `log` mode via CRD, and negative checks that the deferred dims (port-only / IPv6 /
-  label-selector) are logged-not-dropped.
 - **crdsource + agent:** coalesce/debounce informer rebuilds, watch-error
   resilience, optional node-scoped watch (only namespaces with local pods), and
   surface the deferred-dimension count (rules that couldn't be programmed) as a
