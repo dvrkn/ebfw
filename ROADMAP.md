@@ -2,8 +2,7 @@
 
 The running list of planned and deferred work — forward-looking only. What ebfw
 does **today** is documented in [`README.md`](README.md) and [`docs/`](docs/); the
-current automated-test coverage lives in
-[`docs/install.md`](docs/install.md#tests).
+current automated-test coverage lives in [`docs/tests.md`](docs/tests.md).
 
 ## Operator hardening
 

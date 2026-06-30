@@ -17,7 +17,7 @@
 [![Linux kernel ≥ 5.8](https://img.shields.io/badge/kernel-%E2%89%A5%205.8-FCC624?logo=linux&logoColor=black)](docs/install.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[**Install**](docs/install.md) · [**Configuration**](docs/configuration.md) · [**Egress policies**](docs/egresspolicy.md) · [**Roadmap**](ROADMAP.md) · [**Images**](https://github.com/dvrkn/ebfw/pkgs/container/ebfw)
+[**Install**](docs/install.md) · [**Configuration**](docs/configuration.md) · [**Egress policies**](docs/egresspolicy.md) · [**Tests**](docs/tests.md) · [**Roadmap**](ROADMAP.md) · [**Images**](https://github.com/dvrkn/ebfw/pkgs/container/ebfw)
 
 </div>
 
