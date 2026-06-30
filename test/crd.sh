@@ -9,6 +9,10 @@
 #   - a namespaced defaultAction:Deny default-denies ONLY that namespace's pods,
 #     while node-global egress stays Allow (the load-bearing semantic)
 #   - a ClusterEgressPolicy deny applies node-wide
+#   - a podSelector scopes a policy to a labeled subset of pods
+#   - CR lifecycle: editing a CR applies the new rule live (hot-reload), deleting a
+#     CR lifts its enforcement, and an invalid CR is dropped while valid CRs keep
+#     enforcing (both at the operator status and the agent datapath)
 #
 # Builds both images via the repo Dockerfiles (no local Go/clang needed).
 # Requires: Linux, docker, k3d, kubectl, curl, jq, helm.
@@ -92,6 +96,13 @@ accepted() { kubectl get "$1" "$2" ${3:+-n "$3"} -o jsonpath='{.status.condition
 # retry_ok <attempts> <cmd...> — succeeds if any attempt exits 0. Domain-allow
 # rules depend on DNS→IP learning, which races the first connect; retry smooths it.
 retry_ok() { local n="$1"; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 3; done; return 1; }
+
+# reach <ns> <pod> <ip> — exit 0 if the pod can open a TLS connection to the IP
+# (egress allowed), nonzero if it is dropped/EPERM'd. A fresh connection each call,
+# so it reflects the CURRENT map state — what the lifecycle tests below toggle. -k:
+# we measure datapath reachability, not cert trust (a dropped SYN/EPERM fails before
+# the handshake regardless), so any per-IP cert quirk can't masquerade as "blocked".
+reach() { kubectl -n "$1" exec "$2" -- curl -4 -sk -o /dev/null --max-time 8 "https://$3/"; }
 
 # ── probe pods ───────────────────────────────────────────────────────────────
 note "starting probe pods (default/probe, walled/probe2)"
@@ -233,6 +244,108 @@ sel_denied=0; kubectl -n tenants exec sel   -- curl -4 -s -o /dev/null --max-tim
 uns_open=1;   kubectl -n tenants exec unsel -- curl -4 -s -o /dev/null --max-time 8 "https://${BLOCKED_IP}/" && uns_open=0
 [ "$sel_denied" -ne 0 ] && echo "PASS  tenants/sel (app=locked) default-denied (rc=$sel_denied)"          || { echo "FAIL  podSelector did not govern the labeled pod"; fail=1; }
 [ "$uns_open" -eq 0 ]   && echo "PASS  tenants/unsel (app=open) unaffected by the podSelector policy"      || { echo "FAIL  podSelector leaked to an unselected pod"; fail=1; }
+
+# ── CR lifecycle (Tests 7-9): a dedicated namespace/pod, isolated from the state
+# above. The earlier tests only block 1.0.0.0/24 node-wide (Test 5) and 1.1.1.0/24
+# for default/probe (Test 3), so in the `life` namespace BOTH 1.1.1.1 and 8.8.8.8
+# start reachable — clean toggle targets. Lifecycle tests use CIDR rules (programmed
+# directly into the LPM map, no DNS-learning race), so map changes are deterministic
+# after the re-walk window. ──
+LIFE_A_CIDR="${LIFE_A_CIDR:-1.1.1.0/24}"; LIFE_A_IP="${LIFE_A_IP:-1.1.1.1}"
+LIFE_B_CIDR="${LIFE_B_CIDR:-8.8.8.0/24}"; LIFE_B_IP="${LIFE_B_IP:-8.8.8.8}"
+note "creating lifecycle namespace/pod (life/lp)"
+kubectl create namespace life >/dev/null 2>&1 || true
+kubectl -n life run lp --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n life wait --for=condition=Ready pod/lp --timeout=120s >/dev/null || { echo "ERROR: lp not ready"; fail=1; }
+
+# life_pol <cidr-to-deny> — (re)apply the single lifecycle EgressPolicy. kubectl
+# apply REPLACES the existing object, so calling it twice with different CIDRs is
+# exactly the hot-reload edit Test 7 exercises.
+life_pol() {
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: life-pol, namespace: life }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: block
+      action: Deny
+      match: { cidrs: ["$1"] }
+YAML
+}
+
+# ── Test 7: hot-reload — editing a CR applies the new rule live (no restart) ──
+# Deny CIDR-A, confirm it bites and CIDR-B is open; then edit the SAME CR to deny
+# CIDR-B instead. The agent's CRD informer rebuilds and the Programmer reconciles
+# the maps live: CIDR-A must reopen (old rule lifted) AND CIDR-B must close (new
+# rule applied) — all without any pod or agent restart.
+note "Test 7: hot-reload an edited EgressPolicy applies live (deny ${LIFE_A_CIDR} -> ${LIFE_B_CIDR})"
+life_pol "$LIFE_A_CIDR"
+sleep 12  # re-walk maps lp's cgroup + programs the CIDR verdict
+a_denied=0; reach life lp "$LIFE_A_IP" || a_denied=$?
+b_open=1;   reach life lp "$LIFE_B_IP" && b_open=0
+[ "$a_denied" -ne 0 ] && echo "PASS  life/lp denied to ${LIFE_A_IP} (initial rule, rc=$a_denied)"      || { echo "FAIL  initial deny rule not enforced"; fail=1; }
+[ "$b_open" -eq 0 ]   && echo "PASS  life/lp reaches ${LIFE_B_IP} (not yet blocked)"                   || { echo "FAIL  ${LIFE_B_IP} unexpectedly blocked before edit"; fail=1; }
+life_pol "$LIFE_B_CIDR"   # the edit
+sleep 12
+a_open=1;   reach life lp "$LIFE_A_IP" && a_open=0
+b_denied=0; reach life lp "$LIFE_B_IP" || b_denied=$?
+[ "$a_open" -eq 0 ]   && echo "PASS  hot-reload: ${LIFE_A_IP} reachable after edit (old rule lifted live)"        || { echo "FAIL  edited-away rule still enforced (no live reconcile)"; fail=1; }
+[ "$b_denied" -ne 0 ] && echo "PASS  hot-reload: ${LIFE_B_IP} blocked after edit (new rule applied live, rc=$b_denied)" || { echo "FAIL  edited-in rule not enforced live"; fail=1; }
+
+# ── Test 8: deleting a CR lifts its enforcement ──
+# Pre-state from Test 7: life-pol denies ${LIFE_B_CIDR}, so ${LIFE_B_IP} is blocked.
+# Deleting the CR must remove the map entry and reopen egress.
+note "Test 8: deleting the EgressPolicy lifts enforcement"
+pre_denied=0; reach life lp "$LIFE_B_IP" || pre_denied=$?
+kubectl delete egresspolicy life-pol -n life >/dev/null 2>&1 || true
+sleep 12
+post_open=1; reach life lp "$LIFE_B_IP" && post_open=0
+[ "$pre_denied" -ne 0 ] && echo "PASS  life/lp denied to ${LIFE_B_IP} before delete (rc=$pre_denied)" || { echo "FAIL  pre-delete deny not in effect"; fail=1; }
+[ "$post_open" -eq 0 ]  && echo "PASS  deletion lifts enforcement: ${LIFE_B_IP} reachable again"      || { echo "FAIL  enforcement persisted after CR deletion"; fail=1; }
+
+# ── Test 9: an invalid CR is dropped while valid CRs keep enforcing ──
+# Apply a valid deny and confirm it enforces, THEN add an invalid CR alongside it.
+# The operator must mark only the invalid one Accepted=False (valid stays True), and
+# — the load-bearing bit — the AGENT must keep enforcing the valid policy: crdsource
+# drops just the invalid CR from the aggregate, it never fails the whole node.
+note "Test 9: invalid CR is dropped; valid CRs keep enforcing"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: keep-pol, namespace: life }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: block
+      action: Deny
+      match: { cidrs: ["${LIFE_A_CIDR}"] }
+YAML
+sleep 12
+keep_denied=0; reach life lp "$LIFE_A_IP" || keep_denied=$?
+[ "$keep_denied" -ne 0 ] && echo "PASS  keep-pol enforcing: ${LIFE_A_IP} denied (rc=$keep_denied)" || { echo "FAIL  valid policy not enforcing before invalid CR added"; fail=1; }
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: bad-pol, namespace: life }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: bad-cidr
+      action: Deny
+      match: { cidrs: ["not-a-cidr"] }
+YAML
+bad=""; for _ in $(seq 1 20); do [ "$(accepted egresspolicy bad-pol life)" = "False" ] && { bad=1; break; }; sleep 1; done
+[ -n "$bad" ] && echo "PASS  operator marks bad-pol Accepted=False"                              || { echo "FAIL  operator did not reject bad-pol"; fail=1; }
+[ "$(accepted egresspolicy keep-pol life)" = "True" ] && echo "PASS  keep-pol stays Accepted=True alongside the invalid CR" || { echo "FAIL  valid policy lost acceptance when an invalid CR was added"; fail=1; }
+sleep 12  # let the agent rebuild after the invalid apply
+still_denied=0; reach life lp "$LIFE_A_IP" || still_denied=$?
+[ "$still_denied" -ne 0 ] && echo "PASS  agent keeps enforcing the valid policy despite the invalid CR (rc=$still_denied)" || { echo "FAIL  an invalid CR broke enforcement of the valid policy"; fail=1; }
+kubectl delete egresspolicy bad-pol keep-pol -n life >/dev/null 2>&1 || true
 
 echo "# ============================="
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi
