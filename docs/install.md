@@ -141,16 +141,8 @@ Published multi-arch by CI on `main`/tags after the test jobs pass:
 
 ## Tests
 
-```bash
-# Host e2e: runs the binary on a Linux host, generates real curl traffic, and
-# asserts captures — DNS / TLS SNI / HTTP+HTTPS paths / headers / filter / enforce.
-docker build --target bin --output type=local,dest=out .   # -> out/ebfw
-sudo ./test/e2e.sh out/ebfw
-
-# Kubernetes e2e: installs the chart on a throwaway k3d cluster and asserts pod
-# attribution + CRD-driven enforcement end to end.
-./test/crd.sh
-```
+Unit, envtest, and the host + k3d end-to-end suites — and what each asserts — are
+documented in [**tests.md**](tests.md).
 
 ## Repository layout
 
@@ -175,7 +167,7 @@ examples/policy.yaml       example file-based egress policy (also the `policy te
 bpf/egress.bpf.c           the cgroup_skb/egress program
 bpf/sslsnoop.bpf.c         the SSL_write uprobe program
 test/e2e.sh                host e2e (domain / ssl / paths / headers / filter / metrics / enforcement)
-test/crd.sh                k3d e2e (Helm install + pod attribution + CRD-driven enforcement)
+test/crd.sh                k3d e2e (Helm + attribution + CRD enforcement, lifecycle, policy merge)
 Dockerfile                 agent image: multi-stage (BPF + Go), or `--target bin` host binary
 Dockerfile.operator        operator image (pure Go, no eBPF)
 ```

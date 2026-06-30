@@ -1,48 +1,16 @@
 # ebfw roadmap
 
-What ebfw does today and what's planned next. User-facing usage lives in
-[`README.md`](README.md); this file tracks capabilities and the running list of
-deferred / in-progress work.
+The running list of planned and deferred work — forward-looking only. What ebfw
+does **today** is documented in [`README.md`](README.md) and [`docs/`](docs/); the
+current automated-test coverage lives in [`docs/tests.md`](docs/tests.md).
 
-## Today
+## Operator hardening
 
-ebfw is a single-binary per-node agent plus a thin control-plane operator,
-shipped as a Helm chart with multi-arch images on ghcr.io.
+Smooth the rough edges now that the happy path and the full e2e matrix are proven
+(lifecycle, aggregation/merge, cross-namespace isolation, CRD domain-deny, node-wide
+lockdown, log mode, and deferred-dimension negative checks — see
+[`docs/tests.md`](docs/tests.md)).
 
-- **Visibility.** Outgoing domains (DNS + TLS SNI), HTTP/HTTPS request paths and
-  headers, and new TCP connections — node-wide, internal traffic filtered, observe
-  only by default.
-- **Attribution.** Every event is mapped to the originating pod: cgroup id → pod
-  UID/container/QoS via the cgroup path, enriched to `namespace/name` through a
-  node-scoped Pods informer. Structured text/JSON output and Prometheus metrics.
-- **Enforcement.** Allow/deny egress per pod by domain / IP / CIDR / port. A pure
-  `internal/policy` engine drives three modes — `off`, `log` (annotate the verdict,
-  no drop), and `enforce` — programming `LRU_HASH` + `LPM_TRIE` verdict maps.
-  Denials drop at the `cgroup_skb/egress` hook and fail IPv4 TCP `connect()` fast
-  with `EPERM` (`cgroup/connect4`); domain rules are enforced by learning DNS→IP
-  from a `cgroup_skb/ingress` hook (LRU + TTL). Testable as a plain binary via
-  `ebfw policy test`; host + k3d e2e coverage.
-- **Policy as CRDs.** `EgressPolicy` (namespaced) + `ClusterEgressPolicy`
-  (cluster-scoped) in `ebfw.dvrkn.com/v1`, whose spec mirrors `policy.Policy`. Each
-  agent watches both kinds cluster-wide via an in-process informer `PolicySource`
-  (`EBFW_POLICY_SOURCE=crd`) and aggregates them (cluster rules first, then
-  per-namespace rules + default-deny catch-alls; a namespaced Deny never cuts off
-  the node). A thin controller-runtime operator validates each resource and records
-  its `Accepted` status; it never programs maps. Controllers covered by envtest.
-
-## Planned
-
-### Operator hardening
-
-Broaden coverage and smooth the rough edges now that the happy path is proven.
-
-- **e2e coverage:** lifecycle (hot-reload an edited CR → new rule applies live; CR
-  deletion lifts enforcement; an invalid CR is dropped while the rest keep
-  enforcing); aggregation interactions (cluster `defaultAction: Deny` allowlist
-  that keeps DNS/API up, multiple `EgressPolicy` across namespaces,
-  cluster+namespace precedence); more dimensions (domain **deny** via CRD, `log`
-  mode via CRD, and negative checks that deferred dims — port-only / IPv6 /
-  label-selector — are logged-not-dropped).
 - **crdsource + agent:** coalesce/debounce informer rebuilds, watch-error
   resilience, optional node-scoped watch (only namespaces with local pods), and
   surface the deferred-dimension count (rules that couldn't be programmed) as a
@@ -53,7 +21,7 @@ Broaden coverage and smooth the rough edges now that the happy path is proven.
 - **CRD / chart polish:** CEL field validations (`Modify` ⇒ mutations, action
   required), an Age print column, and Helm values for operator probes/resources.
 
-### Datapath & hardening
+## Datapath & hardening
 
 - `connect6` / IPv6 enforcement and IPv6 extension-header parsing.
 - **L7 (method / path) policy enforcement.** The `methods` and `pathPrefix` rule
