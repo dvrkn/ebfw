@@ -13,6 +13,9 @@
 #   - CR lifecycle: editing a CR applies the new rule live (hot-reload), deleting a
 #     CR lifts its enforcement, and an invalid CR is dropped while valid CRs keep
 #     enforcing (both at the operator status and the agent datapath)
+#   - policy merge: multiple policies over ONE pod merge by union of their denies,
+#     cluster + namespaced policies stack on the same pod, and a longer-prefix
+#     Allow overrides a broader Deny (most-specific match)
 #
 # Builds both images via the repo Dockerfiles (no local Go/clang needed).
 # Requires: Linux, docker, k3d, kubectl, curl, jq, helm.
@@ -346,6 +349,95 @@ sleep 12  # let the agent rebuild after the invalid apply
 still_denied=0; reach life lp "$LIFE_A_IP" || still_denied=$?
 [ "$still_denied" -ne 0 ] && echo "PASS  agent keeps enforcing the valid policy despite the invalid CR (rc=$still_denied)" || { echo "FAIL  an invalid CR broke enforcement of the valid policy"; fail=1; }
 kubectl delete egresspolicy bad-pol keep-pol -n life >/dev/null 2>&1 || true
+
+# ── Policy merge (Tests 10-12): multiple policies governing ONE pod, in a fresh
+# `merge` namespace + pod `mp`. The Test-5 ClusterEgressPolicy (deny 1.0.0.0/24
+# node-wide) is still active, so it ALSO governs mp — Test 11 uses that to show
+# cluster + namespaced rules stacking. All merge tests use CIDR rules (the
+# deterministic LPM datapath). NOTE on what we assert: in verdict_for a per-pod
+# (namespaced) map entry is consulted before the node-global (cluster) one, so we
+# only assert merges the datapath honors faithfully — union of denies, cross-scope
+# stacking on different dests, and a longer-prefix Allow beating a broader Deny —
+# never an overlapping cluster-vs-namespace Allow/Deny on the SAME CIDR (engine
+# first-match-wins and kernel most-specific-wins disagree there by design). ──
+MERGE_A_CIDR="${MERGE_A_CIDR:-1.1.1.0/24}"; MERGE_A_IP="${MERGE_A_IP:-1.1.1.1}"; MERGE_A_IP2="${MERGE_A_IP2:-1.1.1.3}"
+MERGE_B_CIDR="${MERGE_B_CIDR:-8.8.8.0/24}"; MERGE_B_IP="${MERGE_B_IP:-8.8.8.8}"
+MERGE_CTL_IP="${MERGE_CTL_IP:-9.9.9.9}"     # control: blocked by none of the merge policies
+note "creating merge namespace/pod (merge/mp)"
+kubectl create namespace merge >/dev/null 2>&1 || true
+kubectl -n merge run mp --image=nicolaka/netshoot --restart=Never --command -- sleep infinity >/dev/null
+kubectl -n merge wait --for=condition=Ready pod/mp --timeout=120s >/dev/null || { echo "ERROR: mp not ready"; fail=1; }
+
+# ── Test 10: two EgressPolicies in one namespace, both selecting mp, merge by the
+# UNION of their deny rules — each policy's deny is independently enforced. ──
+note "Test 10: two EgressPolicies on one pod merge (union of denies)"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: m-deny-a, namespace: merge }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-a
+      action: Deny
+      match: { cidrs: ["${MERGE_A_CIDR}"] }
+YAML
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: m-deny-b, namespace: merge }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: deny-b
+      action: Deny
+      match: { cidrs: ["${MERGE_B_CIDR}"] }
+YAML
+sleep 12
+m_a=0;   reach merge mp "$MERGE_A_IP"   || m_a=$?
+m_b=0;   reach merge mp "$MERGE_B_IP"   || m_b=$?
+m_ctl=1; reach merge mp "$MERGE_CTL_IP" && m_ctl=0
+[ "$m_a" -ne 0 ]   && echo "PASS  merge/mp denied to ${MERGE_A_IP} (policy m-deny-a, rc=$m_a)"          || { echo "FAIL  m-deny-a not enforced in the merge"; fail=1; }
+[ "$m_b" -ne 0 ]   && echo "PASS  merge/mp denied to ${MERGE_B_IP} (policy m-deny-b, rc=$m_b)"          || { echo "FAIL  m-deny-b not enforced in the merge"; fail=1; }
+[ "$m_ctl" -eq 0 ] && echo "PASS  merge/mp still reaches ${MERGE_CTL_IP} (union, not a blanket deny)"   || { echo "FAIL  merge over-blocked an unlisted dest"; fail=1; }
+
+# ── Test 11: a ClusterEgressPolicy and a namespaced EgressPolicy both govern mp;
+# their rules stack. The Test-5 cluster deny (1.0.0.0/24, node-wide) reaches mp,
+# and mp's own namespace policy (m-deny-a) denies 1.1.1.0/24 — so mp is denied to
+# a cluster-scoped AND a namespace-scoped dest at once. ──
+note "Test 11: cluster + namespaced policy stack on the same pod"
+m_cl=0; reach merge mp "$OPEN_IP"     || m_cl=$?   # 1.0.0.1: blocked node-wide by the Test-5 ClusterEgressPolicy
+m_ns=0; reach merge mp "$MERGE_A_IP"  || m_ns=$?   # 1.1.1.1: blocked by the namespaced m-deny-a
+[ "$m_cl" -ne 0 ] && echo "PASS  merge/mp denied to ${OPEN_IP} (ClusterEgressPolicy, node-wide, rc=$m_cl)" || { echo "FAIL  cluster rule did not reach mp"; fail=1; }
+[ "$m_ns" -ne 0 ] && echo "PASS  merge/mp denied to ${MERGE_A_IP} (namespaced EgressPolicy, rc=$m_ns)"     || { echo "FAIL  namespaced rule not enforced alongside the cluster rule"; fail=1; }
+
+# ── Test 12: when policies overlap, the longer-prefix match wins — a /32 Allow
+# beats the enclosing /24 Deny (most-specific). Add a policy allowing
+# ${MERGE_A_IP}/32 while m-deny-a still denies ${MERGE_A_CIDR}: the /32 host
+# becomes reachable (the hole) while the rest of the /24 stays denied. The Allow CR
+# name sorts before the Deny CR (m-allow-host < m-deny-a), so the engine's
+# first-match and the kernel's longest-prefix agree. ──
+note "Test 12: longer-prefix Allow overrides a broader Deny across two policies"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: ebfw.dvrkn.com/v1
+kind: EgressPolicy
+metadata: { name: m-allow-host, namespace: merge }
+spec:
+  podSelector: {}
+  defaultAction: Allow
+  rules:
+    - name: allow-host
+      action: Allow
+      match: { cidrs: ["${MERGE_A_IP}/32"] }
+YAML
+sleep 12
+m_hole=1; reach merge mp "$MERGE_A_IP"  && m_hole=0   # 1.1.1.1/32 Allow carves a hole
+m_rest=0; reach merge mp "$MERGE_A_IP2" || m_rest=$?  # 1.1.1.3 still inside the denied /24
+[ "$m_hole" -eq 0 ] && echo "PASS  merge/mp reaches ${MERGE_A_IP} (/32 Allow overrides the /24 Deny)"          || { echo "FAIL  longer-prefix Allow did not win over the broader Deny"; fail=1; }
+[ "$m_rest" -ne 0 ] && echo "PASS  merge/mp still denied to ${MERGE_A_IP2} (rest of ${MERGE_A_CIDR}, rc=$m_rest)" || { echo "FAIL  the /32 Allow leaked to the rest of the /24"; fail=1; }
+kubectl delete egresspolicy m-deny-a m-deny-b m-allow-host -n merge >/dev/null 2>&1 || true
 
 echo "# ============================="
 if [ "$fail" -eq 0 ]; then echo "RESULT: ALL PASS"; else echo "RESULT: FAILURES"; fi

@@ -39,11 +39,15 @@ Broaden coverage and smooth the rough edges now that the happy path is proven.
 - **e2e coverage:** CR lifecycle is now covered (`test/crd.sh` Tests 7-9:
   hot-reload an edited CR applies the new rule live, CR deletion lifts enforcement,
   and an invalid CR is dropped while valid CRs keep enforcing — asserted at both the
-  operator status and the agent datapath). Still to add: aggregation interactions
-  (cluster `defaultAction: Deny` allowlist that keeps DNS/API up, multiple
-  `EgressPolicy` across namespaces, cluster+namespace precedence); more dimensions
-  (domain **deny** via CRD, `log` mode via CRD, and negative checks that deferred
-  dims — port-only / IPv6 / label-selector — are logged-not-dropped).
+  operator status and the agent datapath). Policy merge is now covered too
+  (`test/crd.sh` Tests 10-12: multiple `EgressPolicy` over one pod merge by union
+  of their denies, a `ClusterEgressPolicy` and a namespaced `EgressPolicy` stack on
+  the same pod, and a longer-prefix Allow overrides a broader Deny — most-specific
+  match). Still to add: a node-wide cluster `defaultAction: Deny` allowlist that
+  keeps DNS/API up, and explicit cross-namespace isolation (multiple `EgressPolicy`
+  in different namespaces not leaking into each other); more dimensions (domain
+  **deny** via CRD, `log` mode via CRD, and negative checks that deferred dims —
+  port-only / IPv6 / label-selector — are logged-not-dropped).
 - **crdsource + agent:** coalesce/debounce informer rebuilds, watch-error
   resilience, optional node-scoped watch (only namespaces with local pods), and
   surface the deferred-dimension count (rules that couldn't be programmed) as a
