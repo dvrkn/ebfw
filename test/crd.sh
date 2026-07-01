@@ -555,10 +555,17 @@ spec:
 YAML
 sleep 12
 df_open=1; reach dom dp "$EXT_DENY_IP" && df_open=0   # :443 deny is deferred -> NOT dropped
-# the deferred-dimension log fires on every apply + 10s re-walk tick; query the
-# NAMED pod with --since (a label selector caps --tail at 10 lines and buries it
-# under JSON event spam) and retry across a couple of ticks.
-df_log=1; for _ in $(seq 1 8); do kubectl -n "$NS" logs "$(agent_pod)" --since=90s 2>/dev/null | grep -q "not enforceable" && { df_log=0; break; }; sleep 3; done
+# The deferred-dimension log fires on every policy apply. Rather than hope a past
+# line is still in the log (the JSON-output agent streams every node egress event,
+# and container log rotation + kubectl's current-segment-only read can bury it),
+# FORCE a fresh apply each iteration by bumping an annotation, then look for the
+# line on the named agent pod within a short, just-written window.
+df_log=1
+for _ in $(seq 1 10); do
+  kubectl -n dom annotate egresspolicy deferred-dims ebfw.dvrkn.com/reapply="$(date +%s%N)" --overwrite >/dev/null 2>&1
+  sleep 2
+  kubectl -n "$NS" logs "$(agent_pod)" --since=20s 2>/dev/null | grep -q "not enforceable" && { df_log=0; break; }
+done
 [ "$df_open" -eq 0 ] && echo "PASS  deferred: port-only :443 deny did NOT drop HTTPS to ${EXT_DENY_IP}" || { echo "FAIL  a deferred (port-only) dim was dropped"; fail=1; }
 [ "$df_log" -eq 0 ]  && echo "PASS  deferred: agent logged the un-enforceable dimensions"               || { echo "FAIL  agent did not log deferred dimensions"; fail=1; }
 kubectl delete egresspolicy deferred-dims -n dom >/dev/null 2>&1 || true
