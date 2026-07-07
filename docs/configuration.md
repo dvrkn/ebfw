@@ -151,8 +151,10 @@ in the event lines, not in metric labels.
   and IPv6, but an IPv6 packet whose next-header is not TCP/UDP directly (a
   hop-by-hop, routing, fragment, or destination-options header) is skipped rather
   than walked. These are rare on normal egress.
-- **HTTPS paths need OpenSSL-dynamic.** Statically-linked TLS has no `libssl.so`
-  to hook — notably Go (`crypto/tls`, often stripped), Java, rustls.
+- **HTTPS paths need OpenSSL-dynamic or Go crypto/tls.** Two uprobes cover these:
+  OpenSSL's `SSL_write` (via `libssl.so`) and Go's `crypto/tls.(*Conn).Write` (via
+  the Go binary's symbol table). Still uncovered: Java, rustls, statically-linked
+  OpenSSL, and *stripped* Go binaries (`-ldflags "-s -w"` removes the symbol).
 - **Single segment** — DNS/TLS/HTTP are parsed from the first packet/segment only;
   larger ClientHellos/requests are truncated. Reassembly is future work.
 - **Request bodies are a stub** (`EBFW_INSPECT_BODY` does nothing yet).

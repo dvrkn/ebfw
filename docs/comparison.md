@@ -34,10 +34,12 @@ egress-firewall slice of Cilium" (`toFQDNs`, L7 HTTP policy, Hubble flow visibil
 1. **No proxy in the data path for L7 visibility.** This is the big one. To see HTTP
    method / path / headers on **HTTPS**, Cilium has to terminate TLS through Envoy —
    a man-in-the-middle with injected certs sitting in every flow. ebfw recovers the
-   same plaintext request line by hooking `SSL_write` *before* encryption: no latency
-   tax, no cert management, no proxy to operate.
-   *Caveat:* the uprobe is OpenSSL-dynamic only — it misses statically-linked TLS
-   (Go `crypto/tls`, Java, rustls). Envoy termination catches all of those.
+   same plaintext request line by hooking the TLS write path *before* encryption: no
+   latency tax, no cert management, no proxy to operate. Two uprobes cover the common
+   cases — OpenSSL's dynamic `SSL_write` (curl, nginx, most C/Python/…) and Go's
+   statically-linked `crypto/tls.(*Conn).Write` (any `net/http` client).
+   *Caveat:* still misses other statically-linked TLS (Java, rustls, OpenSSL-static,
+   stripped Go binaries). Envoy termination catches all of those.
 
 2. **Additive, not a commitment.** Adopting Cilium means adopting (or CNI-chaining
    into) a network dataplane — a cluster-wide, hard-to-reverse decision. ebfw is a
@@ -64,8 +66,8 @@ Stated plainly, because the honest comparison matters:
   gRPC) today. ebfw evaluates those dimensions for log + metrics but **does not yet
   drop on them** — that needs the terminating proxy + TLS MITM we've deliberately
   avoided. It's on the [roadmap](https://github.com/dvrkn/ebfw/blob/main/ROADMAP.md).
-- **Universal TLS coverage.** Envoy termination sees every TLS library; our uprobe
-  sees OpenSSL-dynamic only.
+- **Universal TLS coverage.** Envoy termination sees every TLS library; our uprobes
+  cover OpenSSL-dynamic + Go `crypto/tls` (not Java, rustls, or stripped/static).
 - **Breadth & maturity.** Ingress policy, encryption, load balancing, multi-cluster,
   identity-based scaling, HA, multi-kernel CI, scale tests, CNCF-graduated. ebfw is
   early: IPv6 enforcement is incomplete, there's no map pinning yet, and it's

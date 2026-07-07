@@ -24,11 +24,12 @@ cfg="$(mktemp)"
 metrics="$(mktemp)"
 jlog="$(mktemp)"
 cleanup() {
-  kill "${AGENT:-}" "${JAGENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
-  wait "${AGENT:-}" "${JAGENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
-  rm -f "$log" "$cfg" "$metrics" "$jlog" \
+  kill "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${GCLIENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
+  wait "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${GCLIENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
+  rm -f "$log" "$cfg" "$metrics" "$jlog" "${glog:-}" \
         "${epol:-}" "${elog:-}" "${emetrics:-}" "${dpol:-}" "${dlog:-}" "${dmetrics:-}" \
         "${lpol:-}" "${llog:-}"
+  rm -rf "${gotmp:-}"
 }
 trap cleanup EXIT
 
@@ -125,6 +126,97 @@ if command -v python3 >/dev/null 2>&1; then
   else
     echo "FAIL  json output (lines parse as JSON)"; fail=1
   fi
+fi
+
+# ---- Go native crypto/tls capture (statically-linked TLS) ----
+# curl links OpenSSL's libssl, which the SSL_write uprobe hooks directly. A Go
+# net/http client instead links crypto/tls *statically* into the binary and
+# never calls SSL_write, so its request is invisible to the OpenSSL uprobe — it
+# is captured ONLY via the crypto/tls.(*Conn).Write uprobe. A Go request showing
+# up with its host, path, and header is therefore decisive proof that we recover
+# L7 detail from a statically-linked-TLS binary before encryption.
+#
+# The client is compiled inside a Go container (EBFW_GO_IMAGE, default
+# golang:1.26-trixie) so the test never assumes a host Go toolchain — only Docker,
+# which CI and the dev box already have. The resulting static binary runs on the
+# host under the agent. Set EBFW_GOTLS_CLIENT to a prebuilt binary to skip the
+# container build; otherwise, with no Docker and no prebuilt client, the checks
+# self-skip.
+echo "# ---- Go crypto/tls capture ----"
+GOTLS_PATH="/e2e/go-tls-path"
+GOTLS_HDR_NAME="X-Ebfw-Gotls"
+GOTLS_HDR_VAL="e2e-$$"
+GO_IMAGE="${EBFW_GO_IMAGE:-golang:1.26-trixie}"
+gobin="${EBFW_GOTLS_CLIENT:-}"
+gotmp=""
+if [ -z "$gobin" ] && command -v docker >/dev/null 2>&1; then
+  gotmp="$(mktemp -d)"
+  cat > "$gotmp/main.go" <<'GOEOF'
+// Native Go HTTPS client. crypto/tls is linked statically, so its requests are
+// invisible to the OpenSSL SSL_write uprobe and only captured via the Go
+// crypto/tls.(*Conn).Write uprobe. HTTP/1.1 is forced so the captured plaintext
+// is a deterministic "GET <path>".
+//
+// It loops, issuing a request every second, because uprobe discovery scans /proc
+// on a ~1s cadence: a one-shot process can exit before it is ever seen. Looping
+// guarantees requests keep firing after the uprobe attaches to this binary.
+package main
+
+import (
+	"crypto/tls"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	url, name, val := os.Args[1], os.Args[2], os.Args[3]
+	tr := &http.Transport{TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}
+	client := &http.Client{Transport: tr}
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set(name, val)
+		if resp, err := client.Do(req); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		time.Sleep(time.Second)
+	}
+}
+GOEOF
+  echo "# building Go client in $GO_IMAGE"
+  if docker run --rm -v "$gotmp":/w -w /w "$GO_IMAGE" \
+       sh -c 'go mod init e2egotls >/dev/null 2>&1; CGO_ENABLED=0 go build -o client .' >/dev/null 2>&1 \
+     && [ -x "$gotmp/client" ]; then
+    gobin="$gotmp/client"
+  else
+    echo "# Go client build failed (image pull or compile); go-tls checks will skip"
+  fi
+fi
+
+if [ -n "$gobin" ] && [ -x "$gobin" ]; then
+  glog="$(mktemp)"
+  EBFW_CONFIG="$cfg" EBFW_INSPECT_PATHS=true EBFW_INSPECT_HEADERS=true EBFW_METRICS_ADDR= \
+    "$BIN" > "$glog" 2>&1 &
+  GAGENT=$!
+  sleep 3   # allow cgroup attach
+  # Run the looping client in the background; discovery attaches to it within a
+  # scan or two, and its later requests are captured.
+  "$gobin" "https://${SHOWN}${GOTLS_PATH}" "$GOTLS_HDR_NAME" "$GOTLS_HDR_VAL" &
+  GCLIENT=$!
+  sleep 7
+  kill "$GCLIENT" 2>/dev/null; wait "$GCLIENT" 2>/dev/null
+  kill "$GAGENT" 2>/dev/null; wait "$GAGENT" 2>/dev/null; GAGENT=""
+  echo "# ---- go-tls output ----"; cat "$glog"; echo "# -------------------------"
+  present_in "$glog" "go crypto/tls: uprobe attached"        "attached crypto/tls.*Write uprobe"
+  present_in "$glog" "go crypto/tls: host+path pre-encrypt"  "HTTPS .* GET ${SHOWN}${GOTLS_PATH}"
+  present_in "$glog" "go crypto/tls: header pre-encrypt"     "${GOTLS_HDR_NAME}: ${GOTLS_HDR_VAL}"
+else
+  skip "go crypto/tls: uprobe attached — no Docker / prebuilt client"
+  skip "go crypto/tls: host+path pre-encrypt — no Docker / prebuilt client"
+  skip "go crypto/tls: header pre-encrypt — no Docker / prebuilt client"
 fi
 
 # ---- enforcement: deny a CIDR; the connection must be dropped ----
