@@ -112,11 +112,15 @@ int BPF_UPROBE(ssl_write, void *ssl, const void *buf, int num)
 #if defined(__TARGET_ARCH_x86)
 static __always_inline __u64 go_arg(struct pt_regs *ctx, int i)
 {
+	// Userspace <asm/ptrace.h> names the x86_64 registers with the `r` prefix
+	// (rax/rbx/…); the bare ax/bx/… names exist only in the kernel/vmlinux
+	// struct pt_regs, which we don't include. This matches BPF_UPROBE's own
+	// PT_REGS_PARM* under the UAPI header.
 	switch (i) {
-	case 0: return ctx->ax; // RAX
-	case 1: return ctx->bx; // RBX
-	case 2: return ctx->cx; // RCX
-	case 3: return ctx->di; // RDI
+	case 0: return ctx->rax; // RAX
+	case 1: return ctx->rbx; // RBX
+	case 2: return ctx->rcx; // RCX
+	case 3: return ctx->rdi; // RDI
 	}
 	return 0;
 }
