@@ -24,8 +24,8 @@ cfg="$(mktemp)"
 metrics="$(mktemp)"
 jlog="$(mktemp)"
 cleanup() {
-  kill "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${GCLIENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
-  wait "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${GCLIENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
+  kill "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
+  wait "${AGENT:-}" "${JAGENT:-}" "${GAGENT:-}" "${EAGENT:-}" "${DAGENT:-}" "${LAGENT:-}" 2>/dev/null
   rm -f "$log" "$cfg" "$metrics" "$jlog" "${glog:-}" \
         "${epol:-}" "${elog:-}" "${emetrics:-}" "${dpol:-}" "${dlog:-}" "${dmetrics:-}" \
         "${lpol:-}" "${llog:-}"
@@ -164,12 +164,10 @@ if [ -n "$gobin" ] && [ -x "$gobin" ]; then
     "$BIN" > "$glog" 2>&1 &
   GAGENT=$!
   sleep 3   # allow cgroup attach
-  # Run the looping client in the background; discovery attaches to it within a
-  # scan or two, and its later requests are captured.
-  "$gobin" "https://${SHOWN}${GOTLS_PATH}" "$GOTLS_HDR_NAME" "$GOTLS_HDR_VAL" &
-  GCLIENT=$!
-  sleep 7
-  kill "$GCLIENT" 2>/dev/null; wait "$GCLIENT" 2>/dev/null
+  # The client waits internally (> the ~1s discovery interval) so the uprobe
+  # attaches to it before it sends, then issues a single request and exits.
+  "$gobin" "https://${SHOWN}${GOTLS_PATH}" "$GOTLS_HDR_NAME" "$GOTLS_HDR_VAL" || true
+  sleep 2   # let the captured event drain
   kill "$GAGENT" 2>/dev/null; wait "$GAGENT" 2>/dev/null; GAGENT=""
   echo "# ---- go-tls output ----"; cat "$glog"; echo "# -------------------------"
   present_in "$glog" "go crypto/tls: uprobe attached"        "attached crypto/tls.*Write uprobe"
