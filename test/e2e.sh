@@ -136,61 +136,24 @@ fi
 # up with its host, path, and header is therefore decisive proof that we recover
 # L7 detail from a statically-linked-TLS binary before encryption.
 #
-# The client is compiled inside a Go container (EBFW_GO_IMAGE, default
-# golang:1.26-trixie) so the test never assumes a host Go toolchain — only Docker,
-# which CI and the dev box already have. The resulting static binary runs on the
-# host under the agent. Set EBFW_GOTLS_CLIENT to a prebuilt binary to skip the
-# container build; otherwise, with no Docker and no prebuilt client, the checks
-# self-skip.
+# The client lives in test/fixtures/gotls-client and is compiled via its own
+# Dockerfile, so the test never assumes a host Go toolchain — only Docker, which
+# CI and the dev box already have. The resulting static binary runs on the host
+# under the agent. Set EBFW_GOTLS_CLIENT to a prebuilt binary to skip the build;
+# with no Docker and no prebuilt client, the checks self-skip.
 echo "# ---- Go crypto/tls capture ----"
 GOTLS_PATH="/e2e/go-tls-path"
 GOTLS_HDR_NAME="X-Ebfw-Gotls"
 GOTLS_HDR_VAL="e2e-$$"
-GO_IMAGE="${EBFW_GO_IMAGE:-golang:1.26-trixie}"
+GOTLS_DIR="$(dirname "$0")/fixtures/gotls-client"
 gobin="${EBFW_GOTLS_CLIENT:-}"
 gotmp=""
 if [ -z "$gobin" ] && command -v docker >/dev/null 2>&1; then
   gotmp="$(mktemp -d)"
-  cat > "$gotmp/main.go" <<'GOEOF'
-// Native Go HTTPS client. crypto/tls is linked statically, so its requests are
-// invisible to the OpenSSL SSL_write uprobe and only captured via the Go
-// crypto/tls.(*Conn).Write uprobe. HTTP/1.1 is forced so the captured plaintext
-// is a deterministic "GET <path>".
-//
-// It loops, issuing a request every second, because uprobe discovery scans /proc
-// on a ~1s cadence: a one-shot process can exit before it is ever seen. Looping
-// guarantees requests keep firing after the uprobe attaches to this binary.
-package main
-
-import (
-	"crypto/tls"
-	"io"
-	"net/http"
-	"os"
-	"time"
-)
-
-func main() {
-	url, name, val := os.Args[1], os.Args[2], os.Args[3]
-	tr := &http.Transport{TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}
-	client := &http.Client{Transport: tr}
-	deadline := time.Now().Add(12 * time.Second)
-	for time.Now().Before(deadline) {
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set(name, val)
-		if resp, err := client.Do(req); err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-		time.Sleep(time.Second)
-	}
-}
-GOEOF
-  echo "# building Go client in $GO_IMAGE"
-  if docker run --rm -v "$gotmp":/w -w /w "$GO_IMAGE" \
-       sh -c 'go mod init e2egotls >/dev/null 2>&1; CGO_ENABLED=0 go build -o client .' >/dev/null 2>&1 \
-     && [ -x "$gotmp/client" ]; then
-    gobin="$gotmp/client"
+  echo "# building Go client from $GOTLS_DIR"
+  if docker build --target bin --output "type=local,dest=$gotmp" "$GOTLS_DIR" >/dev/null 2>&1 \
+     && [ -x "$gotmp/gotls-client" ]; then
+    gobin="$gotmp/gotls-client"
   else
     echo "# Go client build failed (image pull or compile); go-tls checks will skip"
   fi
