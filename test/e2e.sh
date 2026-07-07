@@ -139,16 +139,15 @@ fi
 # The client lives in test/fixtures/gotls-client and is compiled via its own
 # Dockerfile, so the test never assumes a host Go toolchain — only Docker, which
 # CI and the dev box already have. The resulting static binary runs on the host
-# under the agent. Set EBFW_GOTLS_CLIENT to a prebuilt binary to skip the build;
-# with no Docker and no prebuilt client, the checks self-skip.
+# under the agent. With no Docker (or a build failure) the checks self-skip.
 echo "# ---- Go crypto/tls capture ----"
 GOTLS_PATH="/e2e/go-tls-path"
 GOTLS_HDR_NAME="X-Ebfw-Gotls"
 GOTLS_HDR_VAL="e2e-$$"
 GOTLS_DIR="$(dirname "$0")/fixtures/gotls-client"
-gobin="${EBFW_GOTLS_CLIENT:-}"
+gobin=""
 gotmp=""
-if [ -z "$gobin" ] && command -v docker >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1; then
   gotmp="$(mktemp -d)"
   echo "# building Go client from $GOTLS_DIR"
   if docker build --target bin --output "type=local,dest=$gotmp" "$GOTLS_DIR" >/dev/null 2>&1 \
@@ -177,9 +176,9 @@ if [ -n "$gobin" ] && [ -x "$gobin" ]; then
   present_in "$glog" "go crypto/tls: host+path pre-encrypt"  "HTTPS .* GET ${SHOWN}${GOTLS_PATH}"
   present_in "$glog" "go crypto/tls: header pre-encrypt"     "${GOTLS_HDR_NAME}: ${GOTLS_HDR_VAL}"
 else
-  skip "go crypto/tls: uprobe attached — no Docker / prebuilt client"
-  skip "go crypto/tls: host+path pre-encrypt — no Docker / prebuilt client"
-  skip "go crypto/tls: header pre-encrypt — no Docker / prebuilt client"
+  skip "go crypto/tls: uprobe attached — no Docker"
+  skip "go crypto/tls: host+path pre-encrypt — no Docker"
+  skip "go crypto/tls: header pre-encrypt — no Docker"
 fi
 
 # ---- enforcement: deny a CIDR; the connection must be dropped ----
