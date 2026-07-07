@@ -11,6 +11,7 @@ package sslsnoop
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -72,7 +73,8 @@ func Run(ctx context.Context, cfg *config.Config, filter *config.Filter, resolve
 	}()
 
 	go discoverLoop(ctx, objs.SslWrite)
-	log.Printf("ebfw sslsnoop: auto-discovering libssl across the node (live capture)")
+	go discoverGoLoop(ctx, objs.GoTlsWrite)
+	log.Printf("ebfw sslsnoop: auto-discovering libssl + Go crypto/tls across the node (live capture)")
 
 	t := newTracker(filter, cfg.Inspect, resolver, sink)
 	for {
@@ -227,6 +229,138 @@ func discoverLoop(ctx context.Context, prog *ebpf.Program) {
 		case <-tick.C:
 		}
 	}
+}
+
+// goTLSWriteSym is the Go symbol we attach to for statically-linked TLS. It is
+// present in the .symtab of any non-stripped Go binary that imports crypto/tls
+// (the default `go build` keeps the symbol table).
+const goTLSWriteSym = "crypto/tls.(*Conn).Write"
+
+// discoverGoLoop attaches the go_tls_write uprobe to the crypto/tls.(*Conn).Write
+// symbol of every unique Go binary on the node, rescanning on the same cadence
+// as the libssl loop to pick up new containers. Symbol presence is immutable per
+// inode, so each binary's ELF is parsed at most once.
+func discoverGoLoop(ctx context.Context, prog *ebpf.Program) {
+	attached := map[string]link.Link{}
+	hasSym := map[string]bool{} // inode -> ELF parsed, symbol present?
+	failed := map[string]bool{} // inode -> attach error already logged
+	defer func() {
+		for _, l := range attached {
+			l.Close()
+		}
+	}()
+	tick := time.NewTicker(discoverInterval)
+	defer tick.Stop()
+	for {
+		for key, path := range discoverExecutables() {
+			if _, ok := attached[key]; ok {
+				continue
+			}
+			present, ok := hasSym[key]
+			if !ok {
+				// First sighting of this binary: parse its symbol table. A parse
+				// error (e.g. the pid exited, path now stale) is left uncached so
+				// the next tick retries via a different live pid.
+				p, err := hasGoTLSSymbol(path)
+				if err != nil {
+					continue
+				}
+				hasSym[key] = p
+				present = p
+			}
+			if !present {
+				continue // not a Go crypto/tls binary
+			}
+			ex, err := link.OpenExecutable(path)
+			if err != nil {
+				if !failed[key] {
+					log.Printf("ebfw sslsnoop: open %s: %v", path, err)
+					failed[key] = true
+				}
+				continue
+			}
+			up, err := ex.Uprobe(goTLSWriteSym, prog, nil)
+			if err != nil {
+				if !failed[key] {
+					log.Printf("ebfw sslsnoop: go uprobe %s: %v", path, err)
+					failed[key] = true
+				}
+				continue
+			}
+			delete(failed, key)
+			attached[key] = up
+			metrics.GoUprobesAttached.Inc()
+			log.Printf("ebfw sslsnoop: attached %s uprobe via %s [inode %s]", goTLSWriteSym, path, key)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// discoverExecutables returns "dev:inode" -> /proc/<pid>/exe for every unique
+// process image on the node, deduped by inode (each physical binary attached
+// once). Unlike a shared library — one file per mount namespace — every process
+// has its own executable, so we must stat every pid's exe rather than dedup by
+// mount namespace. The /proc/<pid>/exe magic symlink is openable for ELF parsing
+// and uprobe attachment across namespaces.
+func discoverExecutables() map[string]string {
+	out := map[string]string{}
+	// Exclude the agent's own binary: ebfw links crypto/tls (via client-go), so
+	// it carries goTLSWriteSym; attaching to ourselves would just capture the
+	// agent's own API-server traffic.
+	var self syscall.Stat_t
+	haveSelf := syscall.Stat("/proc/self/exe", &self) == nil
+
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return out
+	}
+	for _, p := range procs {
+		pid, err := strconv.Atoi(p.Name())
+		if err != nil {
+			continue
+		}
+		exe := fmt.Sprintf("/proc/%d/exe", pid)
+		var st syscall.Stat_t
+		if err := syscall.Stat(exe, &st); err != nil {
+			continue
+		}
+		if haveSelf && st.Dev == self.Dev && st.Ino == self.Ino {
+			continue
+		}
+		key := fmt.Sprintf("%d:%d", st.Dev, st.Ino)
+		if _, ok := out[key]; !ok {
+			out[key] = exe
+		}
+	}
+	return out
+}
+
+// hasGoTLSSymbol reports whether the ELF at path defines goTLSWriteSym in its
+// symbol table (i.e. it is a non-stripped Go binary linking crypto/tls). A
+// missing symbol table is not an error — it just means "not a match".
+func hasGoTLSSymbol(path string) (bool, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	syms, err := f.Symbols()
+	if err != nil {
+		if errors.Is(err, elf.ErrNoSymbols) {
+			return false, nil
+		}
+		return false, err
+	}
+	for i := range syms {
+		if syms[i].Name == goTLSWriteSym {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // discoverLibssl finds the libssl shared object in every container's root

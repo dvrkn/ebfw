@@ -39,6 +39,13 @@ var (
 		Help: "Number of libssl SSL_write uprobes currently attached.",
 	})
 
+	// GoUprobesAttached is the number of Go crypto/tls (*Conn).Write uprobes
+	// attached — one per unique Go binary that links crypto/tls statically.
+	GoUprobesAttached = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ebfw_go_uprobe_attached",
+		Help: "Number of Go crypto/tls (*Conn).Write uprobes currently attached.",
+	})
+
 	// EnforcementDecisionsTotal counts policy verdicts applied to connection-level
 	// events, by action (allow/deny/modify) and mode (log/enforce).
 	EnforcementDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

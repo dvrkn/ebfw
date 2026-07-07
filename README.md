@@ -38,9 +38,11 @@ also sees HTTP paths and headers and lets policy match on method and path
 - **One `cgroup_skb/egress` program** at the node's root cgroup v2 sees egress
   from **every pod on the node** — DNS, TLS ClientHello SNI, plaintext HTTP, and
   new TCP connections — no per-pod sidecar.
-- **An `SSL_write` uprobe** reads HTTPS request plaintext **before** encryption,
-  recovering paths the packet layer can't see. Auto-discovered per container's
-  libssl, live (no sampling).
+- **TLS uprobes** read HTTPS request plaintext **before** encryption, recovering
+  paths and headers the packet layer can't see. Two probes cover the common cases:
+  OpenSSL's `SSL_write` (auto-discovered per container's libssl) and Go's
+  statically-linked `crypto/tls.(*Conn).Write` (auto-discovered per Go binary).
+  Live, no sampling.
 - **Attributed per pod** in-kernel via the originating cgroup id, enriched to
   `namespace/name` by a node-scoped Pods informer. The same maps carry policy
   verdicts back to the kernel for enforcement.
@@ -110,9 +112,10 @@ DaemonSet on any node (any CNI, or no Kubernetes at all), watch egress in `log`
 mode, and pull it back out with zero effect on connectivity — it never touches the
 dataplane.
 
-The headline difference: ebfw reads **HTTPS request paths and headers from an
-`SSL_write` uprobe — before encryption, with no proxy and no TLS MITM.** Cilium
-needs a terminating Envoy and injected certs to see the same thing.
+The headline difference: ebfw reads **HTTPS request paths and headers from TLS
+uprobes (OpenSSL `SSL_write` + Go `crypto/tls`) — before encryption, with no proxy
+and no TLS MITM.** Cilium needs a terminating Envoy and injected certs to see the
+same thing.
 
 ebfw is the lightweight egress firewall + per-pod L7 *visibility* layer; Cilium is
 the full networking platform (and does L7 *enforcement* today, which ebfw doesn't

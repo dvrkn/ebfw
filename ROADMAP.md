@@ -34,5 +34,6 @@ lockdown, log mode, and deferred-dimension negative checks — see
 - Pinned maps + an external map-programming controller (the per-node agent programs
   its own maps for now).
 - TLS/HTTP multi-segment reassembly, TLS 1.3 ECH, cgroup-v1 fallback,
-  request-body inspection, uprobe coverage beyond OpenSSL-dynamic, multi-kernel CI,
+  request-body inspection, uprobe coverage beyond OpenSSL-dynamic + Go crypto/tls
+  (Java, rustls, OpenSSL-static, stripped Go), multi-kernel CI,
   HA, and scale tests.

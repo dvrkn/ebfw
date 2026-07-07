@@ -24,7 +24,10 @@ Linux host, eBPF, root. Covers visibility — DNS, TLS SNI, HTTP/1.x + HTTP/2
 request paths, headers — plus internal-traffic filtering, IPv4 + IPv6 packet
 decoding, JSON output, and enforcement: a CIDR deny drops the connection, a domain
 deny blocks via DNS→IP learning, and `log` mode annotates the verdict without
-dropping.
+dropping. It also builds a native Go `net/http` client (statically-linked
+`crypto/tls`, invisible to the OpenSSL uprobe) and asserts ebfw recovers its host,
+path, and a custom header via the `crypto/tls.(*Conn).Write` uprobe — self-skipping
+where no Go toolchain is present.
 
 ## Kubernetes e2e — `test/crd.sh`
 
